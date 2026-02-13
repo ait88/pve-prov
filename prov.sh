@@ -89,25 +89,27 @@ divider() { echo -e "${DIM}$(printf '%.0s─' {1..60})${RESET}"; }
 prompt() {
     # Usage: prompt "Label" "default" VARNAME
     # Safe: uses printf -v instead of eval
+    # Uses /dev/tty so prompts work inside $() command substitution
     local label="$1" default="$2" varname="$3"
     local input
-    echo -en "  ${BOLD}${label}${RESET}"
-    [[ -n "$default" ]] && echo -en " ${DIM}[${default}]${RESET}"
-    echo -en ": "
-    read -r input
+    echo -en "  ${BOLD}${label}${RESET}" >/dev/tty
+    [[ -n "$default" ]] && echo -en " ${DIM}[${default}]${RESET}" >/dev/tty
+    echo -en ": " >/dev/tty
+    read -r input </dev/tty
     printf -v "$varname" '%s' "${input:-$default}"
 }
 
 prompt_secret() {
     # Usage: prompt_secret "Label" VARNAME
     # Safe: uses printf -v instead of eval
+    # Uses /dev/tty so prompts work inside $() command substitution
     local label="$1" varname="$2"
     local pw1 pw2
     while true; do
-        echo -en "  ${BOLD}${label}${RESET}: "
-        read -rs pw1; echo
-        echo -en "  ${BOLD}Confirm${RESET}: "
-        read -rs pw2; echo
+        echo -en "  ${BOLD}${label}${RESET}: " >/dev/tty
+        read -rs pw1 </dev/tty; echo >/dev/tty
+        echo -en "  ${BOLD}Confirm${RESET}: " >/dev/tty
+        read -rs pw2 </dev/tty; echo >/dev/tty
         if [[ "$pw1" == "$pw2" ]]; then
             if [[ ${#pw1} -lt 5 ]]; then
                 warn "Password must be at least 5 characters. Try again."
@@ -122,14 +124,15 @@ prompt_secret() {
 
 prompt_yesno() {
     # Usage: prompt_yesno "Question" [default: y/n]
+    # Uses /dev/tty so prompts work inside $() command substitution
     local question="$1" default="${2:-y}"
     local yn
     if [[ "$default" == "y" ]]; then
-        echo -en "  ${BOLD}${question}${RESET} ${DIM}[Y/n]${RESET}: "
+        echo -en "  ${BOLD}${question}${RESET} ${DIM}[Y/n]${RESET}: " >/dev/tty
     else
-        echo -en "  ${BOLD}${question}${RESET} ${DIM}[y/N]${RESET}: "
+        echo -en "  ${BOLD}${question}${RESET} ${DIM}[y/N]${RESET}: " >/dev/tty
     fi
-    read -r yn
+    read -r yn </dev/tty
     yn="${yn:-$default}"
     [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]
 }
@@ -264,8 +267,10 @@ select_storage() {
         return
     fi
 
-    echo
-    info "Multiple storage backends available for ${label}:"
+    # Display output must go to /dev/tty since this function is called
+    # inside $() command substitution — stdout is captured, not displayed.
+    echo >/dev/tty
+    echo -e "  ${BLUE}ℹ${RESET}  Multiple storage backends available for ${label}:" >/dev/tty
     local i=1
     while IFS= read -r s; do
         # pvesm status columns: Name  Type  Status  Total  Used  Available  %
@@ -275,7 +280,7 @@ select_storage() {
             | awk -v st="$s" '$1==st {print $6}')
         local avail_human
         avail_human=$(awk "BEGIN {printf \"%.1f GiB\", ${avail_bytes:-0}/1073741824}" 2>/dev/null || echo "? GiB")
-        echo -e "    ${BOLD}${i})${RESET} ${s} ${DIM}(${avail_human} free)${RESET}"
+        echo -e "    ${BOLD}${i})${RESET} ${s} ${DIM}(${avail_human} free)${RESET}" >/dev/tty
         ((i++))
     done <<< "$storages"
 
