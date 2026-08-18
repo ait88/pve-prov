@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pve-provision.sh v1.1
+# pve-provision.sh v1.2
 # Self-contained Proxmox VE LXC/VM provisioner
 #
 # No external script sourcing. No telemetry. Audit once, run forever.
 #
 # Requirements: Run as root on a Proxmox VE host
 # Tested on:    Proxmox VE 8.x / 9.x
+#
+# Changelog v1.2:
+#   - VM: fixed cloud-image import failure. download_cloud_image's status
+#     messages (info/ok) leaked onto stdout, which is captured via $(...),
+#     corrupting the "--scsi0 <storage>:0,import-from=<path>" argument and
+#     causing `qm set` to reject it ("invalid format ... missing key in
+#     comma-separated list property"). Status now goes to stderr; only the
+#     image path is written to stdout.
+#   - Applied the same stdout-hygiene fix to find_lxc_template and
+#     wait_for_network (identical latent capture bug).
+#   - Storage picker: fixed free-space units. `pvesm status` reports KiB,
+#     not bytes, so sizes were shown 1024x too small (a 7.9 TiB pool read
+#     as "7.9 GiB"). Now converts from KiB and auto-scales (MiB/GiB/TiB).
 #
 # Changelog v1.1:
 #   - Replaced eval with printf -v in prompt functions
@@ -28,7 +41,7 @@ set -euo pipefail
 # =============================================================================
 # CONSTANTS & DEFAULTS
 # =============================================================================
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 
 DEFAULT_TYPE="lxc"
 DEFAULT_OS="debian-13"
@@ -274,12 +287,20 @@ select_storage() {
     local i=1
     while IFS= read -r s; do
         # pvesm status columns: Name  Type  Status  Total  Used  Available  %
-        # We want column 6 (Available) which is in bytes
-        local avail_bytes
-        avail_bytes=$(pvesm status -content "$content_type" \
+        # Column 6 (Available) is reported in KiB (1024-byte blocks), NOT bytes.
+        # Convert from KiB and auto-scale the unit so large pools read correctly
+        # (a 7.9 TiB pool was previously shown as "7.9 GiB").
+        local avail_kib
+        avail_kib=$(pvesm status -content "$content_type" \
             | awk -v st="$s" '$1==st {print $6}')
         local avail_human
-        avail_human=$(awk "BEGIN {printf \"%.1f GiB\", ${avail_bytes:-0}/1073741824}" 2>/dev/null || echo "? GiB")
+        avail_human=$(awk -v k="${avail_kib:-0}" 'BEGIN {
+            b = k * 1024
+            split("B KiB MiB GiB TiB PiB", u, " ")
+            n = 1
+            while (b >= 1024 && n < 6) { b /= 1024; n++ }
+            printf "%.1f %s", b, u[n]
+        }' 2>/dev/null || echo "?")
         echo -e "    ${BOLD}${i})${RESET} ${s} ${DIM}(${avail_human} free)${RESET}" >/dev/tty
         ((i++))
     done <<< "$storages"
@@ -311,12 +332,13 @@ wait_for_network() {
     local id="$1" max_wait="${2:-30}"
     local elapsed=0
 
-    info "Waiting for guest networking..."
+    # stdout is captured via $(...) — keep status on stderr, IP on stdout.
+    info "Waiting for guest networking..." >&2
     while (( elapsed < max_wait )); do
         local ip
         ip=$(pct exec "$id" -- hostname -I 2>/dev/null | awk '{print $1}') || true
         if [[ -n "$ip" && "$ip" != "127.0.0.1" ]]; then
-            ok "Guest network ready: ${ip}"
+            ok "Guest network ready: ${ip}" >&2
             echo "$ip"
             return 0
         fi
@@ -539,8 +561,9 @@ find_lxc_template() {
         exit 1
     fi
 
-    info "Downloading template: ${available}"
-    pveam download "$storage" "$available" || {
+    # stdout is captured via $(...) — keep status on stderr, path on stdout.
+    info "Downloading template: ${available}" >&2
+    pveam download "$storage" "$available" >&2 || {
         err "Template download failed."
         exit 1
     }
@@ -686,6 +709,10 @@ configure_lxc_guest() {
 # VM CREATION
 # =============================================================================
 download_cloud_image() {
+    # NOTE: this function's stdout is captured via $(...), so it must emit
+    # ONLY the image path on stdout. All human-readable status goes to stderr;
+    # otherwise the status text is spliced into the --scsi0 import-from path
+    # and `qm set` fails with "invalid format ... missing key".
     local os="$1"
     local url="${CLOUD_IMAGES[$os]}"
     local filename
@@ -695,13 +722,13 @@ download_cloud_image() {
     mkdir -p "$CLOUD_IMG_DIR"
 
     if [[ -f "$filepath" ]]; then
-        ok "Cloud image cached: ${filename}"
+        ok "Cloud image cached: ${filename}" >&2
         echo "$filepath"
         return
     fi
 
-    info "Downloading cloud image: ${filename}"
-    info "URL: ${url}"
+    info "Downloading cloud image: ${filename}" >&2
+    info "URL: ${url}" >&2
     curl -fL --progress-bar \
         --connect-timeout 15 \
         --max-time 900 \
@@ -710,7 +737,7 @@ download_cloud_image() {
         err "Cloud image download failed."
         exit 1
     }
-    ok "Cloud image downloaded"
+    ok "Cloud image downloaded" >&2
     echo "$filepath"
 }
 
