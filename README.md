@@ -11,17 +11,37 @@ A single-file, interactive provisioner for **Debian and Ubuntu** LXC containers 
 - Proxmox VE 8.x / 9.x, amd64, run as `root` on the PVE host.
 - For VMs, an internet connection to fetch the cloud image (cached and checksum-verified after the first run).
 
+## ⚠️ Read this before you run it
+
+**This script runs as `root` on your hypervisor.** It creates and destroys guests, writes to your storage, and downloads images from the internet. A script like that can do anything to your Proxmox host and everything on it.
+
+- **Do not run code you haven't read, including this.** That is why the install command below only *downloads* the file. It deliberately does not pipe into `bash`.
+- Read `prov.sh` (it is a single file) or have someone you trust review it, and **pin to a release tag or commit** you have reviewed rather than `main`. A tag or commit can't change under you; `main` can.
+- Try it on a test node first, or fork it and run your own copy.
+- If someone sends you a link to a copy of this script, don't run it: get it from this repository and check it.
+
+What it does, so you know what you are agreeing to:
+
+- **Contacts (from the host):** `deb.debian.org` (release data), `changelogs.ubuntu.com` (Ubuntu LTS list), `cloud.debian.org` and `cloud-images.ubuntu.com` (VM images and their checksums), Proxmox's own template servers via `pveam`, and `github.com/<user>.keys` **only if** you ask it to import SSH keys. Inside new guests: the distro mirrors, `cli.github.com` **only if** you choose the GitHub CLI, and your apt cache **only if** you choose one.
+- **Writes:** the image cache (`/var/lib/vz/template/cloud`), a temporary cloud-init snippet in `/var/lib/vz/snippets` (removed again once the guest has finished first boot), the guest itself, and its notes.
+- **Destroys:** only a half-created guest from the current run, and only if it carries the `pve-prov` tag. It never touches any other guest.
+- **No telemetry**, no other network calls, no `eval`. `bash prov.sh --help` and `--version` do nothing else.
+
 ## Install / update
 
-Download, read, then run. Updating is the same command.
+One line. It downloads the script and shows it to you; it does not run it. Installing and updating are the same command.
 
 ```bash
-curl -fsSLo prov.sh https://raw.githubusercontent.com/ait88/pve-prov/main/prov.sh
-less prov.sh          # audit it
+curl -fsSLo prov.sh https://raw.githubusercontent.com/ait88/pve-prov/main/prov.sh && less prov.sh
+```
+
+Then, once you are happy with what you read:
+
+```bash
 bash prov.sh
 ```
 
-To pin a version, replace `main` with a release tag (e.g. `v1.3`). `bash prov.sh --version` prints the version you have.
+To pin a version, replace `main` in the URL with a release tag or commit hash you have reviewed (e.g. `v1.3`). `bash prov.sh --version` prints the version you have. To see what an update changes before you run it, download to a new filename and `diff prov.sh prov.new.sh`.
 
 ## What you get
 
@@ -60,7 +80,18 @@ Offers to point the guest at an apt-cacher-ng instance (default `apt-cacher-ng.l
 
 ### VM first boot and cloud-init
 
-Cloud-init configures the VM once. When it reports finished, the script removes its user-data snippet **and** the `cicustom` setting together, so the VM never depends on a file on the host. By default cloud-init is then disabled inside the guest (`/etc/cloud/cloud-init.disabled`), so a later restart can't re-run it (which would regenerate SSH host keys). Use `--keep-cloud-init` to leave it enabled. If the script can't confirm cloud-init finished, it leaves both in place and tells you the command to remove them.
+Cloud-init configures the VM once. When it reports finished, the script removes its user-data snippet **and** the `cicustom` setting together, so the VM never depends on a file on the host. If the script can't confirm cloud-init finished, it leaves both in place and tells you the command to remove them.
+
+**Cloud-init is then disabled inside the guest by default** (`/etc/cloud/cloud-init.disabled`).
+
+Why: once the snippet is gone, Proxmox gives the VM fresh default cloud-init data on its next start, and cloud-init treats that as a *new machine* and sets it up again. We measured what that does on a real host: **a new SSH host key and a new DHCP address**, from a plain restart. Anything you saved from the provisioning output (the IP, the host key in `known_hosts`, an agent's cached connection details) would then be wrong. The first restart after provisioning is usually when this bites: the first-boot package upgrade can install a new kernel, and people tend to reboot a new guest soon after their first login. Disabling cloud-init keeps the IP and host key identical across every restart.
+
+What it does *not* matter for: anything that changes *during* provisioning, before the script prints the summary, is invisible to you.
+
+The trade-off: with cloud-init disabled, later `ipconfig`, user or key changes made in the Proxmox UI's *Cloud-Init* tab are not applied inside the guest. This is a run-once tool, so that is usually fine, but if you want to manage the guest through Proxmox's cloud-init afterwards:
+
+- provision with `--keep-cloud-init`, accepting the restart behaviour above; or
+- on an existing guest, `rm /etc/cloud/cloud-init.disabled` inside it. Expect it to be set up again as a new machine on its next boot (new host key, possibly a new IP), the same as `--keep-cloud-init`. We have not tested this on an already-provisioned guest.
 
 ## Non-interactive use
 
