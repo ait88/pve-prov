@@ -420,9 +420,12 @@ validate_id() {
     local leftovers
     leftovers=$(find_id_leftovers "$id")
     if [[ -n "$leftovers" ]]; then
-        # shellcheck disable=SC2001  # per-line indent of multi-line text
-        VALIDATION_MSG="ID ${id} has leftover volumes or backups; refusing to reuse it:
-$(sed 's/^/        /' <<<"$leftovers")"
+        local n shown
+        n=$(grep -c . <<<"$leftovers")
+        shown=$(head -3 <<<"$leftovers" | sed 's/^/        /')
+        if (( n > 3 )); then shown+=$'\n'"        ... and $((n - 3)) more"; fi
+        VALIDATION_MSG="ID ${id} has ${n} leftover volume(s) or backup(s); refusing to reuse it:
+${shown}"
         return 1
     fi
     return 0
@@ -430,6 +433,8 @@ $(sed 's/^/        /' <<<"$leftovers")"
 
 is_posint()      { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 valid_cores()    { is_posint "$1" && (( $1 <= 512 )); }
+valid_ram()      { is_posint "$1" && (( $1 <= 4096 )); }
+valid_disk()     { is_posint "$1" && (( $1 <= 65536 )); }
 valid_hostname() {
     [[ ${#1} -le 253 && "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
@@ -655,6 +660,16 @@ Acquire::https::Proxy "DIRECT";
 EOF
 }
 
+# Some images ship https mirrors (e.g. the Debian 13 cloud image's
+# /etc/apt/mirrors/*.list), and https goes DIRECT (see above), so the cache would
+# never be used. With a cache enabled, point the distro mirrors at plain http;
+# apt still verifies package signatures. Idempotent; leaves other repos alone.
+apt_https_to_http_cmd() {
+    cat <<'EOF'
+find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i -E 's#https://(deb\.debian\.org|security\.debian\.org|([a-z]{2}\.)?archive\.ubuntu\.com|security\.ubuntu\.com)#http://\1#g' {} +
+EOF
+}
+
 # =============================================================================
 # OS CATALOGUE (resolved live; Debian + Ubuntu only)
 # =============================================================================
@@ -835,8 +850,8 @@ collect_input() {
         prompt_valid PROV_CPU_TYPE "CPU type" "$DEFAULT_CPU_TYPE" valid_cpu_type "Invalid CPU type."
         check_host_cpu_support "$PROV_CPU_TYPE"
     fi
-    prompt_valid PROV_RAM "RAM (GB)" "$DEFAULT_RAM" is_posint "RAM must be a whole number of GB."
-    prompt_valid PROV_DISK "Disk size (GB)" "$DEFAULT_DISK" is_posint "Disk size must be a whole number of GB."
+    prompt_valid PROV_RAM "RAM (GB)" "$DEFAULT_RAM" valid_ram "RAM must be a whole number of GB (1-4096)."
+    prompt_valid PROV_DISK "Disk size (GB)" "$DEFAULT_DISK" valid_disk "Disk size must be a whole number of GB (1-65536)."
     if [[ "$PROV_TYPE" == "vm" ]]; then
         ok "Resources: ${PROV_CPU} CPU (${PROV_CPU_TYPE}) / ${PROV_RAM}GB RAM / ${PROV_DISK}GB Disk"
     else
@@ -1083,6 +1098,7 @@ configure_lxc_guest() {
         info "Configuring apt cache ${PROV_APT_CACHE}..."
         apt_proxy_detect_script "$PROV_APT_CACHE" | lxc_push_file "$id" 0755 /usr/local/bin/apt-proxy-detect
         apt_proxy_conf | lxc_push_file "$id" 0644 /etc/apt/apt.conf.d/01acng
+        lxc_exec "$id" "apt mirror scheme" "$(apt_https_to_http_cmd)"
         ok "Apt cache configured"
     fi
 
@@ -1441,6 +1457,30 @@ $(apt_proxy_detect_script "$PROV_APT_CACHE" | sed 's/^/      /')
 $(apt_proxy_conf | sed 's/^/      /')"
     fi
 
+    # With an apt cache, the distro mirrors must be plain http (see apt_https_to_http_cmd).
+    # Editing the files early is not enough: Debian's cloud-init regenerates
+    # /etc/apt/mirrors/*.list in its config stage (generate_mirrorlists), overwriting
+    # the edit. So (1) tell cloud-init to generate http mirrors, so the first-boot
+    # upgrade uses the cache too, and (2) rewrite again in runcmd, after cloud-init is
+    # done, so the final state is right whatever generated the files.
+    local apt_block="" cache_runcmd=""
+    if [[ -n "$PROV_APT_CACHE" ]]; then
+        if [[ "${OS_FAMILY[$PROV_OS]}" == "debian" ]]; then
+            apt_block="
+apt:
+  primary:
+    - arches: [default]
+      uri: http://deb.debian.org/debian
+  security:
+    - arches: [default]
+      uri: http://deb.debian.org/debian-security
+"
+        fi
+        cache_runcmd="
+  - |
+$(apt_https_to_http_cmd | sed 's/^/    /')"
+    fi
+
     # Build gh-cli runcmd block
     local gh_runcmd=""
     if [[ "$PROV_OPT_GH" == "y" ]]; then
@@ -1484,7 +1524,7 @@ ${ssh_keys_block}
 
 write_files:
 ${write_files}
-
+${apt_block}
 packages:
 ${pkg_list}
 
@@ -1493,7 +1533,7 @@ ssh_pwauth: true
 runcmd:
   - systemctl enable qemu-guest-agent
   - systemctl start qemu-guest-agent
-  - systemctl restart ssh || systemctl restart sshd || true${gh_runcmd}
+  - systemctl restart ssh || systemctl restart sshd || true${cache_runcmd}${gh_runcmd}
   - apt-get clean${disable_ci}
 
 final_message: "pve-provision: cloud-init complete after \$UPTIME seconds"

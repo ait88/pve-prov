@@ -223,6 +223,7 @@ if [[ -f "$T/captured-userdata.yml" ]]; then
     check "guest agent in packages"          grep -q -- '- qemu-guest-agent' "$ud"
     check "cloud-init disabled after first boot" grep -q 'cloud-init.disabled' "$ud"
     check "no apt cache unless asked"        not grep -q 'apt-proxy-detect' "$ud"
+    check "…and no mirror rewriting without a cache" not grep -qE '^apt:|sed -i -E' "$ud"
 else
     fail "user-data snippet was not captured"
 fi
@@ -238,6 +239,23 @@ check "cache host:port in detect script"        grep -q 'apt-cacher-ng.lan/3142'
 check "user-data still valid YAML"              python3 -c "import yaml; yaml.safe_load(open('$ud'))"
 check "cloud-init left enabled with --keep-cloud-init" not grep -q 'cloud-init.disabled' "$ud"
 check "GitHub SSH keys included"                grep -q 'ssh-ed25519 AAAA' "$ud"
+check "Debian: cloud-init told to generate http mirrors" python3 -c "
+import yaml
+d = yaml.safe_load(open('$ud'))
+assert d['apt']['primary'][0]['uri'].startswith('http://'), d.get('apt')
+assert d['apt']['security'][0]['uri'].startswith('http://'), d.get('apt')"
+check "…plus a final runcmd rewrite as safety net"  python3 -c "
+import yaml
+d = yaml.safe_load(open('$ud'))
+cmds = [c for c in d['runcmd'] if isinstance(c, str) and 'sed -i -E' in c and 'https://' in c]
+assert cmds, d['runcmd']"
+run_prov "${VM_ARGS[@]}" --os ubuntu --apt-cache apt-cacher-ng.lan:3142
+ud="$T/captured-userdata.yml"
+check "Ubuntu: no apt mirror override (sources already http)" not grep -q '^apt:' "$ud"
+check "Ubuntu: runcmd rewrite still present"    grep -q 'sed -i -E' "$ud"
+check "Ubuntu user-data valid YAML"             python3 -c "import yaml; yaml.safe_load(open('$ud'))"
+run_prov "${VM_ARGS[@]}" --apt-cache apt-cacher-ng.lan:3142 --keep-cloud-init --cpu-type host --github-user tester
+ud="$T/captured-userdata.yml"
 
 echo "== VM: cloud-init completion NOT confirmed -> snippet and cicustom both kept"
 GUEST_FINISHED=0 run_prov "${VM_ARGS[@]}"; rc=$?
@@ -259,7 +277,14 @@ run_prov "${VM_ARGS[@]}"; rc=$?
 check "ID with leftover volume refused"         test "$rc" -ne 0
 check "leftover volume named in error"          out_has 'vm-930-disk-0'
 check "nothing created"                         not log_has 'qm create'
-echo "930 pbs-store backup/vm/930/2026-01-01T00:00:00Z" > "$T/orphans"
+# many backups: the message must be summarised, not dump every volume
+: > "$T/orphans"
+for d in 01 02 03 04 05 06; do echo "930 local-zfs backup/vm/930/2026-01-${d}T00:00:00Z" >> "$T/orphans"; done
+run_prov "${VM_ARGS[@]}"; rc=$?
+check "many leftovers refused"                  test "$rc" -ne 0
+check "count is reported"                       out_has '6 leftover'
+check "list truncated to a few examples"        out_has '\.\.\. and 3 more'
+check "not every volume is printed"             not out_has '2026-01-06'
 : > "$T/orphans"
 
 echo "== Cleanup trap only destroys guests it created"
@@ -293,7 +318,9 @@ done <<'LIST'
 --cores abc|CPU cores must
 --cores 0|CPU cores must
 --ram 4.5|RAM must
+--ram 999999|RAM must
 --disk -3|Disk size must
+--disk 99999999|Disk size must
 --hostname bad_name!|Hostname must
 --cpu-type pentium|Unknown CPU type
 --bridge nope0|bridge not found
@@ -319,6 +346,7 @@ check "debian-13 template picked from pveam"    log_has 'pct create 931 local:vz
 check "apt detect script pushed"                test -f "$T/pushed/_usr_local_bin_apt-proxy-detect"
 check "apt conf pushed (https DIRECT)"          grep -q 'https::Proxy "DIRECT"' "$T/pushed/_etc_apt_apt.conf.d_01acng"
 check "sshd drop-in pushed"                     grep -q 'PermitRootLogin no' "$T/pushed/_etc_ssh_sshd_config.d_00-pve-prov.conf"
+check "https mirrors switched to http for the cache" log_has 'pct exec 931 .*find /etc/apt .*sed -i -E .*https://'
 check "no sed on sshd_config"                   not log_has "sed -i.*sshd_config"
 check "no destroy on success"                   not log_has 'pct destroy'
 run_prov "${CT_ARGS[@]}" --os ubuntu; rc=$?

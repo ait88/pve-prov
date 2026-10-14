@@ -14,6 +14,9 @@ Fixes and features from [#4](https://github.com/ait88/pve-prov/issues/4). Debian
 - cloud-init sets the short hostname plus the FQDN instead of using the FQDN as the hostname.
 - Input validation for IDs, hostnames, cores/RAM/disk, bridge, storage choice and apt cache; LXC networking failure is now fatal; empty VM IP no longer reaches the notes.
 - Removed Ubuntu 25.04 (EOL).
+- Found by real-host testing: with an apt cache, Debian 13 cloud images fetch from `https://` mirrors, which bypass the cache (apt-cacher-ng refuses `CONNECT`), so the cache silently did nothing. Distro mirrors are now switched to `http://` (apt still verifies signatures): via cloud-init's `apt:` mirror settings for Debian (editing the files early is overwritten by cloud-init's `generate_mirrorlists`), plus a final `runcmd` rewrite; in LXC directly.
+- Leftover-volume/backup refusal now shows a count and the first three entries instead of every backup.
+- RAM (max 4096 GB) and disk (max 65536 GB) are bounded; a thin-provisioned pool otherwise happily accepts a petabyte disk.
 
 ### Added
 - **CPU type selection** for VMs, default `x86-64-v3`, with a host capability warning.
