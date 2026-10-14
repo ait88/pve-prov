@@ -1,85 +1,63 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pve-provision.sh v1.2
-# Self-contained Proxmox VE LXC/VM provisioner
+# pve-provision.sh v1.3
+# Self-contained Proxmox VE LXC/VM provisioner (Debian + Ubuntu)
 #
 # No external script sourcing. No telemetry. Audit once, run forever.
+# Run-once tool: when it finishes, the guest is self-contained and this script
+# is no longer involved. See CHANGELOG.md for release notes.
 #
 # Requirements: Run as root on a Proxmox VE host
 # Tested on:    Proxmox VE 8.x / 9.x
-#
-# Changelog v1.2:
-#   - VM: fixed cloud-image import failure. download_cloud_image's status
-#     messages (info/ok) leaked onto stdout, which is captured via $(...),
-#     corrupting the "--scsi0 <storage>:0,import-from=<path>" argument and
-#     causing `qm set` to reject it ("invalid format ... missing key in
-#     comma-separated list property"). Status now goes to stderr; only the
-#     image path is written to stdout.
-#   - Applied the same stdout-hygiene fix to find_lxc_template and
-#     wait_for_network (identical latent capture bug).
-#   - Storage picker: fixed free-space units. `pvesm status` reports KiB,
-#     not bytes, so sizes were shown 1024x too small (a 7.9 TiB pool read
-#     as "7.9 GiB"). Now converts from KiB and auto-scales (MiB/GiB/TiB).
-#
-# Changelog v1.1:
-#   - Replaced eval with printf -v in prompt functions
-#   - Fixed storage detection empty-string false positive
-#   - Fixed pvesm status column parsing in select_storage
-#   - Expanded valid guest ID range to 100–999999999
-#   - VM storage: no longer selects "iso" storage for cloud images
-#   - Cloud-init: preserves default user with "- default" entry
-#   - Cloud-init snippet gets chmod 600 + auto-cleanup after boot
-#   - apt-get: logs to file, shows tail on error, uses force-conf flags
-#   - apt-get: set -euo pipefail inside pct exec subshells
-#   - curl: added --connect-timeout and --max-time for cloud images
-#   - Password: passed via pct push tempfile instead of shell expansion
-#   - Package display: "gh" not "gh-cli"
-#   - Ubuntu 25.04: marked as non-LTS in menu
 # =============================================================================
 set -euo pipefail
 
 # =============================================================================
 # CONSTANTS & DEFAULTS
 # =============================================================================
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 
-DEFAULT_TYPE="lxc"
-DEFAULT_OS="debian-13"
-DEFAULT_ID=""                    # Auto-detect next free ID
 DEFAULT_HOSTNAME="hostname.lan"
-DEFAULT_CPU=4
+DEFAULT_CPU=4                    # cores
+DEFAULT_CPU_TYPE="x86-64-v3"     # VM only
 DEFAULT_RAM=4                    # GB
 DEFAULT_DISK=50                  # GB
 DEFAULT_BRIDGE="vmbr0"
-DEFAULT_STORAGE=""               # Auto-detect
+DEFAULT_APT_CACHE="${PROV_DEFAULT_APT_CACHE:-apt-cacher-ng.lan:3142}"
 
 BASE_PACKAGES="util-linux curl wget net-tools sudo openssh-server nano"
 VM_EXTRA_PACKAGES="qemu-guest-agent"
 
+# Guests created by this script carry this tag. The failure-cleanup trap will
+# refuse to destroy a guest that doesn't have it.
+GUEST_TAG="pve-prov"
+
+# CPU models offered for VMs
+CPU_TYPES=(x86-64-v2 x86-64-v2-AES x86-64-v3 x86-64-v4 host kvm64)
+
 # APT options: non-interactive, keep existing configs on upgrade
 APT_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
-# Cloud image URLs for VM creation
-declare -A CLOUD_IMAGES=(
-    ["debian-13"]="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
-    ["debian-12"]="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-    ["ubuntu-24.04"]="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-    ["ubuntu-25.04"]="https://cloud-images.ubuntu.com/plucky/current/plucky-server-cloudimg-amd64.img"
-)
+# Cloud image cache directory (override with PROV_CACHE_DIR)
+CLOUD_IMG_DIR="${PROV_CACHE_DIR:-/var/lib/vz/template/cloud}"
 
-# Human-readable OS names
-declare -A OS_NAMES=(
-    ["debian-13"]="Debian 13 (Trixie)"
-    ["debian-12"]="Debian 12 (Bookworm)"
-    ["ubuntu-24.04"]="Ubuntu 24.04 LTS (Noble)"
-    ["ubuntu-25.04"]="Ubuntu 25.04 (Plucky)"
-)
+# Where cloud-init user-data snippets live (the "local" storage's snippets dir)
+SNIPPET_DIR="${PROV_SNIPPET_DIR:-/var/lib/vz/snippets}"
 
-# Cloud image cache directory
-CLOUD_IMG_DIR="/var/lib/vz/template/cloud"
+# VM first-boot waits (seconds) and poll interval; overridable mainly for testing
+AGENT_WAIT_MAX="${PROV_AGENT_WAIT:-420}"
+CLOUDINIT_WAIT_MAX="${PROV_CLOUDINIT_WAIT:-600}"
+POLL_SECS="${PROV_POLL_SECS:-5}"
 
-# Provisioning log file (guest-side apt output)
+# Provisioning log file (guest-side apt output). Kept on failure, removed on success.
 PROVISION_LOG="/tmp/pve-provision-$$.log"
+
+# Set by --yes: never prompt, take defaults for anything not supplied.
+ASSUME_YES=0
+
+# OS catalogue, filled in at run time by resolve_os_catalog()
+declare -A OS_NAMES=() OS_FAMILY=() OS_CODENAME=() OS_VERSION=()
+OS_ORDER=()
 
 # =============================================================================
 # COLOUR & OUTPUT HELPERS
@@ -99,12 +77,128 @@ err()     { echo -e "  ${RED}✖${RESET}  $*" >&2; }
 header()  { echo -e "\n${BOLD}${BLUE}═══ $* ═══${RESET}\n"; }
 divider() { echo -e "${DIM}$(printf '%.0s─' {1..60})${RESET}"; }
 
+# Menu/explanatory text: only shown when we may actually prompt.
+show() {
+    if (( ! ASSUME_YES )); then echo -e "$@"; fi
+}
+
+usage() {
+    cat <<EOF
+pve-provision.sh v${SCRIPT_VERSION} — provision a Debian/Ubuntu LXC container or VM on Proxmox VE
+
+Usage: $(basename "$0") [options]
+
+With no options the script is fully interactive. Any value supplied as a flag
+(or as the matching PROV_* environment variable) is not asked for again.
+With --yes nothing is ever asked: unsupplied values take their defaults.
+
+Guest:
+  --type lxc|vm             guest type (default: lxc)
+  --os ID                   debian-13, ubuntu-26.04, ... or: debian, debian-oldstable,
+                            ubuntu, a release codename, or a menu number
+  --id N                    guest ID (must be unused; default: next free)
+  --hostname NAME           hostname or FQDN (default: ${DEFAULT_HOSTNAME})
+  --cores N                 CPU cores (default: ${DEFAULT_CPU})
+  --cpu-type TYPE           VM CPU model: ${CPU_TYPES[*]} (default: ${DEFAULT_CPU_TYPE})
+  --ram GB                  memory in GB (default: ${DEFAULT_RAM})
+  --disk GB                 disk size in GB (default: ${DEFAULT_DISK})
+  --bridge NAME             network bridge (default: ${DEFAULT_BRIDGE})
+  --storage NAME            storage for the disk/rootfs
+  --template-storage NAME   storage for LXC templates
+
+Software / access:
+  --btop | --no-btop        install btop        (default: yes)
+  --git  | --no-git         install git         (default: yes)
+  --gh   | --no-gh          install GitHub CLI  (default: no)
+  --apt-cache HOST:PORT     use an apt cache (apt-cacher-ng); --no-apt-cache to disable
+  --github-user NAME        import SSH keys from github.com/NAME
+  --sysadmin-password-file F  read the sysadmin password from F (or PROV_SYSADMIN_PW);
+                            if neither is given with --yes, a random one is generated
+                            and stored in the Proxmox notes
+  --keep-cloud-init         VMs: leave cloud-init enabled after first boot
+                            (default: disabled, so a later reboot can't re-run it)
+
+Other:
+  -y, --yes                 non-interactive, skip the confirmation
+  --version                 print version
+  -h, --help                this help
+EOF
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+# All PROV_* settings start empty; empty means "ask (or default)".
+PROV_VARS=(PROV_TYPE PROV_OS PROV_ID PROV_HOSTNAME PROV_CPU PROV_CPU_TYPE PROV_RAM PROV_DISK
+    PROV_BRIDGE PROV_DISK_STORAGE PROV_TPL_STORAGE PROV_OPT_BTOP PROV_OPT_GIT PROV_OPT_GH
+    PROV_SYSADMIN_PW PROV_GITHUB_USER PROV_SSH_KEYS PROV_ROOT_PW PROV_APT_CACHE
+    PROV_KEEP_CLOUD_INIT PROV_SYSADMIN_PW_GENERATED)
+for _v in "${PROV_VARS[@]}"; do
+    printf -v "$_v" '%s' "${!_v:-}"
+done
+unset _v
+
+parse_args() {
+    need_arg() {
+        if [[ $# -lt 2 || "$2" == --* ]]; then
+            err "Option $1 requires a value"
+            exit 2
+        fi
+    }
+    while (( $# )); do
+        case "$1" in
+            -h|--help)          usage; exit 0 ;;
+            --version)          echo "pve-provision.sh v${SCRIPT_VERSION}"; exit 0 ;;
+            -y|--yes)           ASSUME_YES=1 ;;
+            --type)             need_arg "$@"; PROV_TYPE="$2"; shift ;;
+            --os)               need_arg "$@"; PROV_OS="$2"; shift ;;
+            --id)               need_arg "$@"; PROV_ID="$2"; shift ;;
+            --hostname)         need_arg "$@"; PROV_HOSTNAME="$2"; shift ;;
+            --cores)            need_arg "$@"; PROV_CPU="$2"; shift ;;
+            --cpu-type)         need_arg "$@"; PROV_CPU_TYPE="$2"; shift ;;
+            --ram)              need_arg "$@"; PROV_RAM="$2"; shift ;;
+            --disk)             need_arg "$@"; PROV_DISK="$2"; shift ;;
+            --bridge)           need_arg "$@"; PROV_BRIDGE="$2"; shift ;;
+            --storage)          need_arg "$@"; PROV_DISK_STORAGE="$2"; shift ;;
+            --template-storage) need_arg "$@"; PROV_TPL_STORAGE="$2"; shift ;;
+            --btop)             PROV_OPT_BTOP="y" ;;
+            --no-btop)          PROV_OPT_BTOP="n" ;;
+            --git)              PROV_OPT_GIT="y" ;;
+            --no-git)           PROV_OPT_GIT="n" ;;
+            --gh)               PROV_OPT_GH="y" ;;
+            --no-gh)            PROV_OPT_GH="n" ;;
+            --apt-cache)        need_arg "$@"; PROV_APT_CACHE="$2"; shift ;;
+            --no-apt-cache)     PROV_APT_CACHE="none" ;;
+            --github-user)      need_arg "$@"; PROV_GITHUB_USER="$2"; shift ;;
+            --sysadmin-password-file)
+                need_arg "$@"
+                [[ -r "$2" ]] || { err "Cannot read password file: $2"; exit 2; }
+                PROV_SYSADMIN_PW="$(head -n1 "$2")"
+                shift ;;
+            --keep-cloud-init)  PROV_KEEP_CLOUD_INIT="y" ;;
+            *)                  err "Unknown option: $1 (see --help)"; exit 2 ;;
+        esac
+        shift
+    done
+}
+
+# =============================================================================
+# PROMPT HELPERS
+# =============================================================================
 prompt() {
     # Usage: prompt "Label" "default" VARNAME
-    # Safe: uses printf -v instead of eval
-    # Uses /dev/tty so prompts work inside $() command substitution
+    # - VARNAME already set (flag/env)  -> keep it, don't ask
+    # - --yes                           -> take the default, don't ask
+    # - otherwise ask on /dev/tty (so prompts work inside $() substitution)
     local label="$1" default="$2" varname="$3"
     local input
+    if [[ -n "${!varname:-}" ]]; then
+        return 0
+    fi
+    if (( ASSUME_YES )); then
+        printf -v "$varname" '%s' "$default"
+        return 0
+    fi
     echo -en "  ${BOLD}${label}${RESET}" >/dev/tty
     [[ -n "$default" ]] && echo -en " ${DIM}[${default}]${RESET}" >/dev/tty
     echo -en ": " >/dev/tty
@@ -112,10 +206,31 @@ prompt() {
     printf -v "$varname" '%s' "${input:-$default}"
 }
 
+# Validators set VALIDATION_MSG to explain a rejection.
+VALIDATION_MSG=""
+
+prompt_valid() {
+    # Usage: prompt_valid VARNAME "Label" "default" validator_fn "fallback error message"
+    # Interactive: re-asks until valid. Preset (flag/env) or --yes: exit on invalid.
+    local varname="$1" label="$2" default="$3" validator="$4" errmsg="$5"
+    local preset=0
+    [[ -n "${!varname:-}" ]] && preset=1
+    while true; do
+        prompt "$label" "$default" "$varname"
+        VALIDATION_MSG=""
+        if "$validator" "${!varname}"; then
+            return 0
+        fi
+        err "${VALIDATION_MSG:-$errmsg}"
+        if (( preset || ASSUME_YES )); then
+            exit 1
+        fi
+        printf -v "$varname" '%s' ""
+    done
+}
+
 prompt_secret() {
     # Usage: prompt_secret "Label" VARNAME
-    # Safe: uses printf -v instead of eval
-    # Uses /dev/tty so prompts work inside $() command substitution
     local label="$1" varname="$2"
     local pw1 pw2
     while true; do
@@ -136,8 +251,7 @@ prompt_secret() {
 }
 
 prompt_yesno() {
-    # Usage: prompt_yesno "Question" [default: y/n]
-    # Uses /dev/tty so prompts work inside $() command substitution
+    # Usage: prompt_yesno "Question" [default: y/n]   (returns 0 for yes)
     local question="$1" default="${2:-y}"
     local yn
     if [[ "$default" == "y" ]]; then
@@ -150,11 +264,33 @@ prompt_yesno() {
     [[ "${yn,,}" == "y" || "${yn,,}" == "yes" ]]
 }
 
+ask_flag() {
+    # Usage: ask_flag VARNAME "Question" default(y/n)
+    # Sets VARNAME to y/n. Preset values are normalised; --yes takes the default.
+    local varname="$1" question="$2" default="$3"
+    if [[ -n "${!varname:-}" ]]; then
+        case "${!varname,,}" in
+            y|yes|1|true)  printf -v "$varname" '%s' "y" ;;
+            n|no|0|false)  printf -v "$varname" '%s' "n" ;;
+            *) err "Invalid value for ${varname}: ${!varname} (use y or n)"; exit 1 ;;
+        esac
+        return 0
+    fi
+    if (( ASSUME_YES )); then
+        printf -v "$varname" '%s' "$default"
+    elif prompt_yesno "$question" "$default"; then
+        printf -v "$varname" '%s' "y"
+    else
+        printf -v "$varname" '%s' "n"
+    fi
+}
+
 # =============================================================================
 # CLEANUP TRAP
 # =============================================================================
 CLEANUP_CTID=""
 CLEANUP_TYPE=""
+CLEANUP_SNIPPET=""
 CLEANUP_FILES=()
 
 cleanup() {
@@ -162,19 +298,38 @@ cleanup() {
     if [[ $exit_code -ne 0 && -n "$CLEANUP_CTID" ]]; then
         echo
         warn "Script failed (exit $exit_code). Cleaning up..."
+        # Only ever destroy a guest that we created (carries our tag).
+        local conf=""
         if [[ "$CLEANUP_TYPE" == "lxc" ]]; then
-            pct stop "$CLEANUP_CTID" 2>/dev/null || true
-            pct destroy "$CLEANUP_CTID" 2>/dev/null || true
+            conf=$(pct config "$CLEANUP_CTID" 2>/dev/null || true)
         elif [[ "$CLEANUP_TYPE" == "vm" ]]; then
-            qm stop "$CLEANUP_CTID" 2>/dev/null || true
-            qm destroy "$CLEANUP_CTID" --purge 2>/dev/null || true
+            conf=$(qm config "$CLEANUP_CTID" 2>/dev/null || true)
         fi
-        ok "Cleaned up partial ${CLEANUP_TYPE^^} ${CLEANUP_CTID}"
+        if grep -qE "^tags:.*${GUEST_TAG}" <<<"$conf"; then
+            if [[ "$CLEANUP_TYPE" == "lxc" ]]; then
+                pct stop "$CLEANUP_CTID" 2>/dev/null || true
+                pct destroy "$CLEANUP_CTID" --purge 2>/dev/null || true
+            else
+                qm stop "$CLEANUP_CTID" 2>/dev/null || true
+                qm destroy "$CLEANUP_CTID" --purge 2>/dev/null || true
+            fi
+            ok "Cleaned up partial ${CLEANUP_TYPE^^} ${CLEANUP_CTID}"
+        else
+            warn "Guest ${CLEANUP_CTID} is missing the '${GUEST_TAG}' tag — NOT destroying it."
+        fi
+        if [[ -n "$CLEANUP_SNIPPET" ]]; then
+            rm -f "$CLEANUP_SNIPPET" 2>/dev/null || true
+        fi
     fi
     for f in "${CLEANUP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null || true
     done
-    rm -f "$PROVISION_LOG" 2>/dev/null || true
+    # Keep the provisioning log when something failed so it can be read.
+    if [[ $exit_code -eq 0 ]]; then
+        rm -f "$PROVISION_LOG" 2>/dev/null || true
+    elif [[ -s "$PROVISION_LOG" ]]; then
+        warn "Provisioning log kept: ${PROVISION_LOG}"
+    fi
 }
 trap cleanup EXIT
 
@@ -208,13 +363,19 @@ preflight() {
     ok "Architecture: amd64"
 
     # Required tools
-    for tool in curl openssl pvesh pct qm pveam; do
+    for tool in curl openssl pvesh pvesm pct qm pveam timeout sha256sum sha512sum getent; do
         if ! command -v "$tool" &>/dev/null; then
             err "Required tool '${tool}' not found."
             exit 1
         fi
     done
     ok "All required tools available"
+
+    # Interactive mode needs a terminal
+    if (( ! ASSUME_YES )) && ! { : </dev/tty; } 2>/dev/null; then
+        err "No terminal available for prompts. Use --yes (and flags) to run non-interactively."
+        exit 1
+    fi
 }
 
 # =============================================================================
@@ -225,19 +386,85 @@ get_next_free_id() {
     pvesh get /cluster/nextid 2>/dev/null || echo "100"
 }
 
+# Volumes/backups belonging to <id> on any active storage (guest disks left
+# behind by an earlier guest, backups on PBS/dir storage, ...).
+find_id_leftovers() {
+    local id="$1" s out
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        out=$(timeout 20 pvesm list "$s" --vmid "$id" 2>/dev/null | awk 'NR>1 {print $1}') || true
+        [[ -n "$out" ]] && echo "$out"
+    done < <(pvesm status 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+    return 0
+}
+
 validate_id() {
+    # Rejects any ID that is, or recently was, in use. Sets VALIDATION_MSG.
     local id="$1"
-    # Proxmox supports IDs 100–999999999
-    [[ "$id" =~ ^[0-9]+$ ]] || return 1
-    (( id >= 100 && id <= 999999999 )) || return 1
-    # Check it's not already in use by a VM or LXC
-    [[ ! -f "/etc/pve/qemu-server/${id}.conf" ]] || return 1
-    [[ ! -f "/etc/pve/lxc/${id}.conf" ]] || return 1
-    # Also check LVM volumes
-    if command -v lvs &>/dev/null; then
-        if lvs --noheadings -o lv_name 2>/dev/null | grep -qE "(^|[-_])${id}($|[-_])"; then
-            return 1
-        fi
+    if ! [[ "$id" =~ ^[1-9][0-9]*$ ]] || (( id < 100 || id > 999999999 )); then
+        VALIDATION_MSG="ID must be a number between 100 and 999999999."
+        return 1
+    fi
+    # Configs on any cluster node
+    if compgen -G "/etc/pve/nodes/*/qemu-server/${id}.conf" >/dev/null \
+        || compgen -G "/etc/pve/nodes/*/lxc/${id}.conf" >/dev/null; then
+        VALIDATION_MSG="ID ${id} is already used by a VM or container in this cluster."
+        return 1
+    fi
+    # Authoritative cluster-wide check
+    if ! pvesh get /cluster/nextid --vmid "$id" >/dev/null 2>&1; then
+        VALIDATION_MSG="Proxmox reports ID ${id} is not available (in use, or cluster not quorate)."
+        return 1
+    fi
+    # Orphaned disks and backups
+    local leftovers
+    leftovers=$(find_id_leftovers "$id")
+    if [[ -n "$leftovers" ]]; then
+        # shellcheck disable=SC2001  # per-line indent of multi-line text
+        VALIDATION_MSG="ID ${id} has leftover volumes or backups; refusing to reuse it:
+$(sed 's/^/        /' <<<"$leftovers")"
+        return 1
+    fi
+    return 0
+}
+
+is_posint()      { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+valid_cores()    { is_posint "$1" && (( $1 <= 512 )); }
+valid_hostname() {
+    [[ ${#1} -le 253 && "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+valid_bridge() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]+$ && -e "/sys/class/net/$1" ]]
+}
+valid_cpu_type() {
+    local t
+    for t in "${CPU_TYPES[@]}"; do
+        [[ "$1" == "$t" ]] && return 0
+    done
+    VALIDATION_MSG="Unknown CPU type '$1'. Choose one of: ${CPU_TYPES[*]}"
+    return 1
+}
+valid_apt_cache() {
+    # host:port
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?:([0-9]{1,5})$ ]] && (( BASH_REMATCH[2] >= 1 && BASH_REMATCH[2] <= 65535 ))
+}
+
+# Warn (never fail) if this host's CPU lacks features of the requested level.
+check_host_cpu_support() {
+    local want="$1" need="" flags missing="" f
+    case "$want" in
+        x86-64-v2)     need="cx16 popcnt sse4_1 sse4_2 ssse3" ;;
+        x86-64-v2-AES) need="cx16 popcnt sse4_1 sse4_2 ssse3 aes" ;;
+        x86-64-v3)     need="avx avx2 bmi1 bmi2 fma f16c movbe abm xsave" ;;
+        x86-64-v4)     need="avx avx2 bmi1 bmi2 fma f16c movbe abm xsave avx512f avx512bw avx512cd avx512dq avx512vl" ;;
+        *)             return 0 ;;
+    esac
+    flags=" $(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2 || true) "
+    for f in $need; do
+        [[ "$flags" == *" $f "* ]] || missing+=" $f"
+    done
+    if [[ -n "$missing" ]]; then
+        warn "This host's CPU lacks:${missing} (needed by ${want}). The VM may fail to start here."
     fi
     return 0
 }
@@ -253,13 +480,11 @@ hash_password() {
 
 detect_storage() {
     # Find active storage backends for a given content type.
-    # Returns newline-separated list, or exits on failure.
     local content_type="$1"
     local storages
     storages=$(pvesm status -content "$content_type" 2>/dev/null \
         | awk 'NR>1 && $3=="active" {print $1}')
 
-    # Guard against empty result
     if [[ -z "${storages// /}" ]]; then
         err "No active storage found for content type '${content_type}'."
         exit 1
@@ -269,14 +494,32 @@ detect_storage() {
 }
 
 select_storage() {
-    local content_type="$1" label="$2"
+    # Usage: select_storage content_type label [preset]
+    local content_type="$1" label="$2" preset="${3:-}"
     local storages
     storages=$(detect_storage "$content_type")
     local count
     count=$(echo "$storages" | wc -l)
 
+    if [[ -n "$preset" ]]; then
+        if ! grep -qxF -- "$preset" <<<"$storages"; then
+            err "Storage '${preset}' is not an active ${content_type} storage. Available: $(echo "$storages" | tr '\n' ' ')"
+            exit 1
+        fi
+        echo "$preset"
+        return
+    fi
+
     if [[ "$count" -eq 1 ]]; then
         echo "$storages"
+        return
+    fi
+
+    if (( ASSUME_YES )); then
+        local first
+        first=$(echo "$storages" | head -1)
+        info "Using storage ${first} for ${label} (first of: $(echo "$storages" | tr '\n' ' '))" >&2
+        echo "$first"
         return
     fi
 
@@ -288,8 +531,6 @@ select_storage() {
     while IFS= read -r s; do
         # pvesm status columns: Name  Type  Status  Total  Used  Available  %
         # Column 6 (Available) is reported in KiB (1024-byte blocks), NOT bytes.
-        # Convert from KiB and auto-scale the unit so large pools read correctly
-        # (a 7.9 TiB pool was previously shown as "7.9 GiB").
         local avail_kib
         avail_kib=$(pvesm status -content "$content_type" \
             | awk -v st="$s" '$1==st {print $6}')
@@ -306,7 +547,14 @@ select_storage() {
     done <<< "$storages"
 
     local choice
-    prompt "Select storage for ${label} (1-$((i-1)))" "1" choice
+    while true; do
+        prompt "Select storage for ${label} (1-$((i-1)))" "1" choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); then
+            break
+        fi
+        echo -e "  ${YELLOW}⚠${RESET}  Enter a number between 1 and $((i-1))." >/dev/tty
+        choice=""
+    done
     echo "$storages" | sed -n "${choice}p"
 }
 
@@ -367,92 +615,249 @@ lxc_exec() {
     fi
 }
 
+# Single source of truth for what gets installed in the guest.
+# "install" excludes gh (separate apt repo); "display" includes it.
+guest_packages() {
+    local mode="${1:-install}" pkgs="$BASE_PACKAGES"
+    [[ "$PROV_TYPE" == "vm" ]] && pkgs+=" ${VM_EXTRA_PACKAGES}"
+    [[ "$PROV_OPT_BTOP" == "y" ]] && pkgs+=" btop"
+    [[ "$PROV_OPT_GIT" == "y" ]] && pkgs+=" git"
+    [[ "$mode" == "display" && "$PROV_OPT_GH" == "y" ]] && pkgs+=" gh"
+    echo "$pkgs"
+}
+
+# Content of the sshd drop-in. Drop-ins in sshd_config.d are read before the
+# main file's own settings and sshd keeps the FIRST value it sees, so ours wins
+# over cloud-init's 50-cloud-init.conf (editing sshd_config with sed does not).
+sshd_dropin_content() {
+    cat <<'EOF'
+PermitRootLogin no
+PasswordAuthentication yes
+EOF
+}
+
+# apt Proxy-Auto-Detect helper: use the cache if it answers within 1s, else DIRECT,
+# so a dead cache never breaks apt / unattended-upgrades.
+apt_proxy_detect_script() {
+    local hostport="$1"
+    cat <<EOF
+#!/bin/bash
+# apt Proxy-Auto-Detect: print the cache if its port answers within 1s, else DIRECT.
+timeout 1 bash -c '</dev/tcp/${hostport%:*}/${hostport#*:}' 2>/dev/null && echo "http://${hostport}" || echo DIRECT
+EOF
+}
+
+# HTTPS repos go direct: apt-cacher-ng refuses CONNECT tunnels (403 CONNECT denied).
+apt_proxy_conf() {
+    cat <<'EOF'
+Acquire::http::Proxy-Auto-Detect "/usr/local/bin/apt-proxy-detect";
+Acquire::https::Proxy "DIRECT";
+EOF
+}
+
+# =============================================================================
+# OS CATALOGUE (resolved live; Debian + Ubuntu only)
+# =============================================================================
+add_os() {
+    # Usage: add_os id label family codename version
+    OS_ORDER+=("$1")
+    OS_NAMES["$1"]="$2"
+    OS_FAMILY["$1"]="$3"
+    OS_CODENAME["$1"]="$4"
+    OS_VERSION["$1"]="$5"
+}
+
+resolve_os_catalog() {
+    # Debian: stable + oldstable straight from the Release files.
+    # Ubuntu: the two newest supported LTS releases from Canonical's metadata.
+    # If a source can't be reached we fall back to the last known releases.
+    local suite rel code ver fb_code fb_ver used_fallback=0
+    for suite in stable oldstable; do
+        if [[ "$suite" == "stable" ]]; then fb_code="trixie"; fb_ver="13"; else fb_code="bookworm"; fb_ver="12"; fi
+        rel=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+            "https://deb.debian.org/debian/dists/${suite}/Release" 2>/dev/null) || rel=""
+        code=$(awk -F': ' '$1=="Codename" {print $2; exit}' <<<"$rel")
+        ver=$(awk -F': ' '$1=="Version" {print $2; exit}' <<<"$rel")
+        if [[ -z "$code" || ! "$ver" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            code="$fb_code"; ver="$fb_ver"; used_fallback=1
+        fi
+        add_os "debian-${ver%%.*}" "Debian ${ver%%.*} (${code}, ${suite} ${ver})" debian "$code" "$ver"
+    done
+
+    local meta lts
+    meta=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+        "https://changelogs.ubuntu.com/meta-release-lts" 2>/dev/null) || meta=""
+    # Supported LTS entries, newest first: "codename version"
+    lts=$(awk 'BEGIN {RS=""; FS="\n"}
+        {d=""; v=""; s="";
+         for (i = 1; i <= NF; i++) {
+             if ($i ~ /^Dist: /)      d = substr($i, 7)
+             else if ($i ~ /^Version: /)   v = substr($i, 10)
+             else if ($i ~ /^Supported: /) s = substr($i, 12)
+         }
+         if (s == 1 && d != "" && v != "") print d, v}' <<<"$meta" | tail -2 | tac) || lts=""
+    if [[ -z "$lts" ]]; then
+        lts=$'resolute 26.04.1 LTS\nnoble 24.04.5 LTS'
+        used_fallback=1
+    fi
+    local dist vfull vshort
+    while read -r dist vfull _; do
+        vshort=$(awk -F. '{print $1 "." $2}' <<<"$vfull")
+        add_os "ubuntu-${vshort}" "Ubuntu ${vshort} LTS (${dist})" ubuntu "$dist" "$vshort"
+    done <<<"$lts"
+
+    if (( used_fallback )); then
+        warn "Could not read live release data; using built-in fallback releases."
+    fi
+}
+
+os_nth_of_family() {
+    # Usage: os_nth_of_family family n   -> prints the n-th (1-based) matching id
+    local family="$1" n="$2" id count=0
+    for id in "${OS_ORDER[@]}"; do
+        if [[ "${OS_FAMILY[$id]}" == "$family" ]]; then
+            count=$((count + 1))
+            if (( count == n )); then echo "$id"; return 0; fi
+        fi
+    done
+    return 1
+}
+
+resolve_os_choice() {
+    # Accepts a menu number, an id, a codename, or an alias. Prints the id.
+    local want="${1,,}" id
+    if [[ "$want" =~ ^[0-9]+$ ]] && (( want >= 1 && want <= ${#OS_ORDER[@]} )); then
+        echo "${OS_ORDER[want-1]}"
+        return 0
+    fi
+    for id in "${OS_ORDER[@]}"; do
+        if [[ "$want" == "$id" || "$want" == "${OS_CODENAME[$id]}" ]]; then
+            echo "$id"
+            return 0
+        fi
+    done
+    case "$want" in
+        debian|debian-stable)  os_nth_of_family debian 1 ;;
+        debian-oldstable)      os_nth_of_family debian 2 ;;
+        ubuntu|ubuntu-lts)     os_nth_of_family ubuntu 1 ;;
+        ubuntu-lts-prev)       os_nth_of_family ubuntu 2 ;;
+        *)                     return 1 ;;
+    esac
+}
+
+os_image_url() {
+    local id="$1" code="${OS_CODENAME[$1]}" ver="${OS_VERSION[$1]}"
+    if [[ "${OS_FAMILY[$id]}" == "debian" ]]; then
+        echo "https://cloud.debian.org/images/cloud/${code}/latest/debian-${ver%%.*}-genericcloud-amd64.qcow2"
+    else
+        echo "https://cloud-images.ubuntu.com/${code}/current/${code}-server-cloudimg-amd64.img"
+    fi
+}
+
+os_sums_url() {
+    local id="$1" code="${OS_CODENAME[$1]}"
+    if [[ "${OS_FAMILY[$id]}" == "debian" ]]; then
+        echo "https://cloud.debian.org/images/cloud/${code}/latest/SHA512SUMS"
+    else
+        echo "https://cloud-images.ubuntu.com/${code}/current/SHA256SUMS"
+    fi
+}
+
+sha_of() {
+    # Usage: sha_of family file   (Debian publishes SHA512SUMS, Ubuntu SHA256SUMS)
+    if [[ "$1" == "debian" ]]; then
+        sha512sum "$2" | awk '{print $1}'
+    else
+        sha256sum "$2" | awk '{print $1}'
+    fi
+}
+
 # =============================================================================
 # COLLECT USER INPUT
 # =============================================================================
-
-declare PROV_TYPE PROV_OS PROV_ID PROV_HOSTNAME PROV_CPU PROV_RAM PROV_DISK
-declare PROV_BRIDGE PROV_DISK_STORAGE PROV_TPL_STORAGE
-declare PROV_OPT_BTOP PROV_OPT_GIT PROV_OPT_GH
-declare PROV_SYSADMIN_PW PROV_GITHUB_USER PROV_SSH_KEYS
-declare PROV_ROOT_PW
-
 collect_input() {
     header "Provisioning Configuration"
 
     # --- Type ---
     divider
-    echo -e "  ${BOLD}Guest Type${RESET}"
-    echo -e "    1) LXC Container ${DIM}(lightweight, shared kernel)${RESET}"
-    echo -e "    2) Virtual Machine ${DIM}(full isolation, own kernel)${RESET}"
-    local type_choice
-    prompt "Select type" "1" type_choice
-    case "$type_choice" in
+    if [[ -z "$PROV_TYPE" ]]; then
+        show "  ${BOLD}Guest Type${RESET}"
+        show "    1) LXC Container ${DIM}(lightweight, shared kernel)${RESET}"
+        show "    2) Virtual Machine ${DIM}(full isolation, own kernel)${RESET}"
+    fi
+    prompt "Select type" "1" PROV_TYPE
+    case "${PROV_TYPE,,}" in
         1|lxc)  PROV_TYPE="lxc" ;;
         2|vm)   PROV_TYPE="vm" ;;
-        *)      err "Invalid type. Use 1 or 2."; exit 1 ;;
+        *)      err "Invalid type '${PROV_TYPE}'. Use lxc or vm."; exit 1 ;;
     esac
     ok "Type: ${PROV_TYPE^^}"
 
     # --- OS ---
     divider
-    echo -e "  ${BOLD}Operating System${RESET}"
-    echo -e "    1) Debian 13 (Trixie)"
-    echo -e "    2) Debian 12 (Bookworm)"
-    echo -e "    3) Ubuntu 24.04 LTS (Noble)"
-    echo -e "    4) Ubuntu 25.04 (Plucky) ${DIM}— non-LTS, EOL Jan 2026${RESET}"
-    local os_choice
-    prompt "Select OS" "1" os_choice
-    case "$os_choice" in
-        1) PROV_OS="debian-13" ;;
-        2) PROV_OS="debian-12" ;;
-        3) PROV_OS="ubuntu-24.04" ;;
-        4) PROV_OS="ubuntu-25.04" ;;
-        *) err "Invalid OS choice."; exit 1 ;;
-    esac
+    if [[ -z "$PROV_OS" ]]; then
+        show "  ${BOLD}Operating System${RESET} ${DIM}(current releases, resolved live)${RESET}"
+        local i=1 id
+        for id in "${OS_ORDER[@]}"; do
+            show "    ${i}) ${OS_NAMES[$id]}"
+            i=$((i + 1))
+        done
+    fi
+    prompt "Select OS" "1" PROV_OS
+    local resolved
+    resolved=$(resolve_os_choice "$PROV_OS") || {
+        err "Unknown OS '${PROV_OS}'. Available: ${OS_ORDER[*]}"
+        exit 1
+    }
+    PROV_OS="$resolved"
     ok "OS: ${OS_NAMES[$PROV_OS]}"
 
     # --- ID ---
     divider
     local suggested_id
     suggested_id=$(get_next_free_id)
-    while true; do
-        prompt "Guest ID (100+)" "$suggested_id" PROV_ID
-        if validate_id "$PROV_ID"; then
-            break
-        fi
-        warn "ID ${PROV_ID} is invalid or already in use. Try another."
-    done
+    prompt_valid PROV_ID "Guest ID (100+)" "$suggested_id" validate_id "Invalid or already-used ID."
     ok "ID: ${PROV_ID}"
 
     # --- Hostname ---
     divider
-    prompt "Hostname" "$DEFAULT_HOSTNAME" PROV_HOSTNAME
-    PROV_HOSTNAME=$(echo "${PROV_HOSTNAME,,}" | tr -d ' ')
+    prompt_valid PROV_HOSTNAME "Hostname" "$DEFAULT_HOSTNAME" valid_hostname \
+        "Hostname must be a valid DNS name (letters, digits, hyphens, dots)."
+    PROV_HOSTNAME="${PROV_HOSTNAME,,}"
     ok "Hostname: ${PROV_HOSTNAME}"
 
     # --- Resources ---
     divider
-    prompt "CPU cores" "$DEFAULT_CPU" PROV_CPU
-    prompt "RAM (GB)" "$DEFAULT_RAM" PROV_RAM
-    prompt "Disk size (GB)" "$DEFAULT_DISK" PROV_DISK
-    ok "Resources: ${PROV_CPU} CPU / ${PROV_RAM}GB RAM / ${PROV_DISK}GB Disk"
+    prompt_valid PROV_CPU "CPU cores" "$DEFAULT_CPU" valid_cores "CPU cores must be a whole number (1-512)."
+    if [[ "$PROV_TYPE" == "vm" ]]; then
+        show "  ${DIM}CPU type: x86-64-v3 suits any host from ~2015 on; use x86-64-v2-AES for mixed/older"
+        show "  clusters, or 'host' for best performance (no live migration across CPU generations).${RESET}"
+        prompt_valid PROV_CPU_TYPE "CPU type" "$DEFAULT_CPU_TYPE" valid_cpu_type "Invalid CPU type."
+        check_host_cpu_support "$PROV_CPU_TYPE"
+    fi
+    prompt_valid PROV_RAM "RAM (GB)" "$DEFAULT_RAM" is_posint "RAM must be a whole number of GB."
+    prompt_valid PROV_DISK "Disk size (GB)" "$DEFAULT_DISK" is_posint "Disk size must be a whole number of GB."
+    if [[ "$PROV_TYPE" == "vm" ]]; then
+        ok "Resources: ${PROV_CPU} CPU (${PROV_CPU_TYPE}) / ${PROV_RAM}GB RAM / ${PROV_DISK}GB Disk"
+    else
+        ok "Resources: ${PROV_CPU} CPU / ${PROV_RAM}GB RAM / ${PROV_DISK}GB Disk"
+    fi
 
     # --- Network ---
     divider
-    prompt "Network bridge" "$DEFAULT_BRIDGE" PROV_BRIDGE
+    prompt_valid PROV_BRIDGE "Network bridge" "$DEFAULT_BRIDGE" valid_bridge "Network interface/bridge not found on this host."
     ok "Bridge: ${PROV_BRIDGE}"
 
     # --- Storage ---
     divider
     if [[ "$PROV_TYPE" == "lxc" ]]; then
-        PROV_TPL_STORAGE=$(select_storage "vztmpl" "templates")
-        PROV_DISK_STORAGE=$(select_storage "rootdir" "container rootfs")
+        PROV_TPL_STORAGE=$(select_storage "vztmpl" "templates" "$PROV_TPL_STORAGE")
+        PROV_DISK_STORAGE=$(select_storage "rootdir" "container rootfs" "$PROV_DISK_STORAGE")
     else
         # For VMs: cloud images are downloaded to a local cache dir, not managed
         # by Proxmox storage content types. We only need disk storage for the VM.
         PROV_TPL_STORAGE=""
-        PROV_DISK_STORAGE=$(select_storage "images" "VM disks")
+        PROV_DISK_STORAGE=$(select_storage "images" "VM disks" "$PROV_DISK_STORAGE")
     fi
     if [[ -n "$PROV_TPL_STORAGE" ]]; then
         ok "Template storage: ${PROV_TPL_STORAGE}"
@@ -461,35 +866,72 @@ collect_input() {
 
     # --- Optional Packages ---
     header "Optional Packages"
-    PROV_OPT_BTOP="n"
-    PROV_OPT_GIT="n"
-    PROV_OPT_GH="n"
-    prompt_yesno "Install btop (system monitor)?" "y" && PROV_OPT_BTOP="y"
-    prompt_yesno "Install git?" "y" && PROV_OPT_GIT="y"
-    prompt_yesno "Install GitHub CLI (gh)?" "n" && PROV_OPT_GH="y"
+    ask_flag PROV_OPT_BTOP "Install btop (system monitor)?" "y"
+    ask_flag PROV_OPT_GIT "Install git?" "y"
+    ask_flag PROV_OPT_GH "Install GitHub CLI (gh)?" "n"
+
+    # --- Apt cache ---
+    divider
+    if [[ -z "$PROV_APT_CACHE" ]]; then
+        # Interactive: offer it, defaulting to yes when the cache host resolves from here.
+        # Non-interactive: off unless asked for.
+        if (( ASSUME_YES )); then
+            PROV_APT_CACHE="none"
+        else
+            local cache_default="n"
+            getent hosts "${DEFAULT_APT_CACHE%:*}" >/dev/null 2>&1 && cache_default="y"
+            if prompt_yesno "Use an apt cache (apt-cacher-ng)?" "$cache_default"; then
+                PROV_APT_CACHE=""
+                prompt_valid PROV_APT_CACHE "Apt cache (host:port)" "$DEFAULT_APT_CACHE" valid_apt_cache \
+                    "Apt cache must look like host:port."
+            else
+                PROV_APT_CACHE="none"
+            fi
+        fi
+    elif [[ "${PROV_APT_CACHE,,}" == "none" ]]; then
+        PROV_APT_CACHE="none"
+    else
+        valid_apt_cache "$PROV_APT_CACHE" || { err "Apt cache must look like host:port."; exit 1; }
+    fi
+    if [[ "$PROV_APT_CACHE" == "none" ]]; then
+        PROV_APT_CACHE=""
+    else
+        ok "Apt cache: ${PROV_APT_CACHE} (falls back to direct if unreachable)"
+    fi
 
     # --- User Configuration ---
     header "User Configuration"
-    info "Root will get a random password (stored in Proxmox notes)"
+    info "Root will get a random password (stored in Proxmox notes; console login only)"
     PROV_ROOT_PW=$(generate_password)
     ok "Root password generated"
 
     divider
     info "Creating 'sysadmin' user with sudo access"
-    prompt_secret "Set sysadmin password" PROV_SYSADMIN_PW
+    if [[ -n "$PROV_SYSADMIN_PW" ]]; then
+        if [[ ${#PROV_SYSADMIN_PW} -lt 5 ]]; then
+            err "sysadmin password must be at least 5 characters."
+            exit 1
+        fi
+    elif (( ASSUME_YES )); then
+        PROV_SYSADMIN_PW=$(generate_password)
+        PROV_SYSADMIN_PW_GENERATED="y"
+        ok "sysadmin password generated (stored in Proxmox notes)"
+    else
+        prompt_secret "Set sysadmin password" PROV_SYSADMIN_PW
+    fi
 
     divider
-    PROV_GITHUB_USER=""
-    PROV_SSH_KEYS=""
-    if prompt_yesno "Import SSH keys from GitHub?" "y"; then
-        prompt "GitHub username" "" PROV_GITHUB_USER
-        if [[ -n "$PROV_GITHUB_USER" ]]; then
-            PROV_SSH_KEYS=$(fetch_github_keys "$PROV_GITHUB_USER") || true
-            if [[ -n "$PROV_SSH_KEYS" ]]; then
-                local key_count
-                key_count=$(echo "$PROV_SSH_KEYS" | wc -l)
-                ok "Fetched ${key_count} SSH key(s) from github.com/${PROV_GITHUB_USER}"
-            fi
+    if [[ -z "$PROV_GITHUB_USER" && "$ASSUME_YES" -eq 0 ]]; then
+        if prompt_yesno "Import SSH keys from GitHub?" "y"; then
+            prompt "GitHub username" "" PROV_GITHUB_USER
+        fi
+    fi
+    if [[ -n "$PROV_GITHUB_USER" && -z "$PROV_SSH_KEYS" ]]; then
+        PROV_SSH_KEYS=$(fetch_github_keys "$PROV_GITHUB_USER") || true
+        if [[ -n "$PROV_SSH_KEYS" ]]; then
+            local key_count
+            key_count=$(echo "$PROV_SSH_KEYS" | wc -l)
+            ok "Fetched ${key_count} SSH key(s) from github.com/${PROV_GITHUB_USER}"
         fi
     fi
 }
@@ -504,22 +946,21 @@ confirm_settings() {
     echo -e "  ${BOLD}ID:${RESET}          ${PROV_ID}"
     echo -e "  ${BOLD}Hostname:${RESET}    ${PROV_HOSTNAME}"
     echo -e "  ${BOLD}CPU:${RESET}         ${PROV_CPU} cores"
+    [[ "$PROV_TYPE" == "vm" ]] && echo -e "  ${BOLD}CPU type:${RESET}    ${PROV_CPU_TYPE}"
     echo -e "  ${BOLD}RAM:${RESET}         ${PROV_RAM} GB"
     echo -e "  ${BOLD}Disk:${RESET}        ${PROV_DISK} GB"
     echo -e "  ${BOLD}Bridge:${RESET}      ${PROV_BRIDGE}"
     echo -e "  ${BOLD}Disk Store:${RESET}  ${PROV_DISK_STORAGE}"
-    echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}(random — stored in notes)${RESET}"
+    echo -e "  ${BOLD}Apt cache:${RESET}   ${PROV_APT_CACHE:-none}"
+    echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}(random — stored in notes, console login only)${RESET}"
     echo -e "  ${BOLD}sysadmin:${RESET}    password auth + sudo"
     [[ -n "$PROV_SSH_KEYS" ]] && echo -e "  ${BOLD}SSH Keys:${RESET}    from github.com/${PROV_GITHUB_USER}"
-
-    local pkgs="$BASE_PACKAGES"
-    [[ "$PROV_TYPE" == "vm" ]] && pkgs+=" ${VM_EXTRA_PACKAGES}"
-    [[ "$PROV_OPT_BTOP" == "y" ]] && pkgs+=" btop"
-    [[ "$PROV_OPT_GIT" == "y" ]] && pkgs+=" git"
-    [[ "$PROV_OPT_GH" == "y" ]] && pkgs+=" gh"
-    echo -e "  ${BOLD}Packages:${RESET}    ${DIM}${pkgs}${RESET}"
+    echo -e "  ${BOLD}Packages:${RESET}    ${DIM}$(guest_packages display)${RESET}"
     echo
 
+    if (( ASSUME_YES )); then
+        return 0
+    fi
     if ! prompt_yesno "Proceed with provisioning?" "y"; then
         info "Aborted by user."
         exit 0
@@ -532,13 +973,11 @@ confirm_settings() {
 find_lxc_template() {
     local os="$1" storage="$2"
     local search_term
-
-    case "$os" in
-        debian-13)    search_term="debian-13-standard" ;;
-        debian-12)    search_term="debian-12-standard" ;;
-        ubuntu-24.04) search_term="ubuntu-24.04-standard" ;;
-        ubuntu-25.04) search_term="ubuntu-25.04-standard" ;;
-    esac
+    if [[ "${OS_FAMILY[$os]}" == "debian" ]]; then
+        search_term="debian-${OS_VERSION[$os]%%.*}-standard"
+    else
+        search_term="ubuntu-${OS_VERSION[$os]}-standard"
+    fi
 
     # Check if already downloaded
     local local_template
@@ -550,14 +989,20 @@ find_lxc_template() {
         return
     fi
 
-    # Find available template online
+    # Find available template online (refresh the index once if it's missing)
     local available
     available=$(pveam available --section system 2>/dev/null \
         | grep "$search_term" | sort -V | tail -1 | awk '{print $2}') || true
+    if [[ -z "$available" ]]; then
+        pveam update >&2 || true
+        available=$(pveam available --section system 2>/dev/null \
+            | grep "$search_term" | sort -V | tail -1 | awk '{print $2}') || true
+    fi
 
     if [[ -z "$available" ]]; then
-        err "No template found for ${OS_NAMES[$os]}."
+        err "No LXC template found for ${OS_NAMES[$os]}."
         err "Check: pveam available --section system | grep '${search_term}'"
+        err "(Proxmox may not publish a template for the newest release yet; a VM works regardless.)"
         exit 1
     fi
 
@@ -571,6 +1016,16 @@ find_lxc_template() {
     echo "${storage}:vztmpl/${available}"
 }
 
+# Push a file into a container with a mode: lxc_push_file id mode dest <<< content
+lxc_push_file() {
+    local id="$1" mode="$2" dest="$3" tmp
+    tmp=$(mktemp /tmp/pve-push-XXXXXX)
+    CLEANUP_FILES+=("$tmp")
+    cat > "$tmp"
+    pct push "$id" "$tmp" "$dest" --perms "$mode" >> "$PROVISION_LOG" 2>&1
+    rm -f "$tmp"
+}
+
 create_lxc() {
     header "Creating LXC Container"
 
@@ -580,10 +1035,10 @@ create_lxc() {
 
     local ram_mb=$(( PROV_RAM * 1024 ))
 
-    info "Creating container ${PROV_ID}..."
-    CLEANUP_CTID="$PROV_ID"
-    CLEANUP_TYPE="lxc"
+    # Last-moment re-check: never create over (or later destroy) an existing guest.
+    validate_id "$PROV_ID" || { err "$VALIDATION_MSG"; exit 1; }
 
+    info "Creating container ${PROV_ID}..."
     pct create "$PROV_ID" "$template" \
         --hostname "$PROV_HOSTNAME" \
         --cores "$PROV_CPU" \
@@ -592,10 +1047,14 @@ create_lxc() {
         --net0 "name=eth0,bridge=${PROV_BRIDGE},ip=dhcp" \
         --unprivileged 1 \
         --features "nesting=1" \
+        --tags "$GUEST_TAG" \
         --onboot 0 \
         --start 0 \
         --password "$PROV_ROOT_PW"
 
+    # Only now is there something of ours to clean up on failure.
+    CLEANUP_CTID="$PROV_ID"
+    CLEANUP_TYPE="lxc"
     ok "Container created"
 
     info "Starting container..."
@@ -606,6 +1065,10 @@ create_lxc() {
     sleep 3
     local guest_ip
     guest_ip=$(wait_for_network "$PROV_ID" 30)
+    if [[ "$guest_ip" == "pending" ]]; then
+        err "Container has no network (DHCP on bridge ${PROV_BRIDGE}?). Cannot install packages."
+        exit 1
+    fi
 
     configure_lxc_guest "$PROV_ID" "$guest_ip"
 }
@@ -615,10 +1078,16 @@ configure_lxc_guest() {
 
     header "Configuring LXC Guest"
 
-    # Build package list
-    local packages="$BASE_PACKAGES"
-    [[ "$PROV_OPT_BTOP" == "y" ]] && packages+=" btop"
-    [[ "$PROV_OPT_GIT" == "y" ]] && packages+=" git"
+    # Apt cache first, so the package installs below use it
+    if [[ -n "$PROV_APT_CACHE" ]]; then
+        info "Configuring apt cache ${PROV_APT_CACHE}..."
+        apt_proxy_detect_script "$PROV_APT_CACHE" | lxc_push_file "$id" 0755 /usr/local/bin/apt-proxy-detect
+        apt_proxy_conf | lxc_push_file "$id" 0644 /etc/apt/apt.conf.d/01acng
+        ok "Apt cache configured"
+    fi
+
+    local packages
+    packages=$(guest_packages install)
 
     info "Updating package lists..."
     lxc_exec "$id" "apt-get update" \
@@ -633,6 +1102,7 @@ configure_lxc_guest() {
     # GitHub CLI (needs separate repo)
     if [[ "$PROV_OPT_GH" == "y" ]]; then
         info "Installing GitHub CLI..."
+        # shellcheck disable=SC2016  # single quotes intentional: expanded inside the guest
         lxc_exec "$id" "GitHub CLI installation" '
             mkdir -p -m 755 /etc/apt/keyrings
             curl -fsSL --connect-timeout 10 --max-time 30 \
@@ -661,14 +1131,13 @@ configure_lxc_guest() {
     rm -f "$pw_tmpfile"
     ok "sysadmin user created with sudo"
 
-    # SSH configuration
+    # SSH configuration (drop-in, so cloud-init/other drop-ins can't override it)
     info "Configuring SSH..."
+    pct exec "$id" -- mkdir -p /etc/ssh/sshd_config.d >> "$PROVISION_LOG" 2>&1
+    sshd_dropin_content | lxc_push_file "$id" 0644 /etc/ssh/sshd_config.d/00-pve-prov.conf
     lxc_exec "$id" "SSH configuration" '
         systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
-        systemctl start ssh 2>/dev/null || systemctl start sshd 2>/dev/null || true
-        sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
-        sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
     '
     ok "SSH configured (password auth enabled, root login disabled)"
 
@@ -714,31 +1183,64 @@ download_cloud_image() {
     # otherwise the status text is spliced into the --scsi0 import-from path
     # and `qm set` fails with "invalid format ... missing key".
     local os="$1"
-    local url="${CLOUD_IMAGES[$os]}"
-    local filename
+    local family="${OS_FAMILY[$os]}"
+    local url sums_url filename filepath
+    url=$(os_image_url "$os")
+    sums_url=$(os_sums_url "$os")
     filename=$(basename "$url")
-    local filepath="${CLOUD_IMG_DIR}/${filename}"
+    filepath="${CLOUD_IMG_DIR}/${filename}"
 
     mkdir -p "$CLOUD_IMG_DIR"
 
+    # Upstream checksum: used to verify downloads and to notice stale cache entries
+    local sums want have
+    sums=$(curl -fsSL --connect-timeout 15 --max-time 60 "$sums_url") || {
+        err "Could not fetch checksums: ${sums_url}"
+        exit 1
+    }
+    want=$(awk -v f="$filename" '{n = $2; sub(/^\*/, "", n); if (n == f) {print $1; exit}}' <<<"$sums")
+    if [[ -z "$want" ]]; then
+        err "No checksum for ${filename} in ${sums_url}"
+        exit 1
+    fi
+
     if [[ -f "$filepath" ]]; then
-        ok "Cloud image cached: ${filename}" >&2
-        echo "$filepath"
-        return
+        have=$(sha_of "$family" "$filepath")
+        if [[ "$have" == "$want" ]]; then
+            ok "Cloud image cached and verified: ${filename}" >&2
+            echo "$filepath"
+            return
+        fi
+        info "Cached image is outdated or incomplete — refreshing: ${filename}" >&2
     fi
 
     info "Downloading cloud image: ${filename}" >&2
     info "URL: ${url}" >&2
+    CLEANUP_FILES+=("${filepath}.part")
     curl -fL --progress-bar \
         --connect-timeout 15 \
         --max-time 900 \
-        -o "$filepath" "$url" || {
-        rm -f "$filepath"
+        -o "${filepath}.part" "$url" || {
+        rm -f "${filepath}.part"
         err "Cloud image download failed."
         exit 1
     }
-    ok "Cloud image downloaded" >&2
+    have=$(sha_of "$family" "${filepath}.part")
+    if [[ "$have" != "$want" ]]; then
+        rm -f "${filepath}.part"
+        err "Checksum mismatch for ${filename} (the image may have just been updated upstream — try again)."
+        exit 1
+    fi
+    mv -f "${filepath}.part" "$filepath"
+    ok "Cloud image downloaded and verified" >&2
     echo "$filepath"
+}
+
+guest_file_exists() {
+    # Usage: guest_file_exists vmid path   (via the QEMU guest agent)
+    local out
+    out=$(qm guest exec "$1" -- test -f "$2" 2>/dev/null) || return 1
+    grep -qE '"exitcode"[[:space:]]*:[[:space:]]*0' <<<"$out"
 }
 
 create_vm() {
@@ -749,14 +1251,16 @@ create_vm() {
 
     local ram_mb=$(( PROV_RAM * 1024 ))
 
+    # Last-moment re-check: never create over (or later destroy) an existing guest.
+    validate_id "$PROV_ID" || { err "$VALIDATION_MSG"; exit 1; }
+
     info "Creating VM ${PROV_ID}..."
-    CLEANUP_CTID="$PROV_ID"
-    CLEANUP_TYPE="vm"
 
     # Create the VM shell with modern settings
     qm create "$PROV_ID" \
         --name "$PROV_HOSTNAME" \
         --cores "$PROV_CPU" \
+        --cpu "$PROV_CPU_TYPE" \
         --memory "$ram_mb" \
         --net0 "virtio,bridge=${PROV_BRIDGE}" \
         --scsihw virtio-scsi-single \
@@ -764,13 +1268,18 @@ create_vm() {
         --machine q35 \
         --efidisk0 "${PROV_DISK_STORAGE}:0,efitype=4m" \
         --agent 1 \
+        --tags "$GUEST_TAG" \
         --onboot 0 \
         --ostype l26
+
+    # Only now is there something of ours to clean up on failure.
+    CLEANUP_CTID="$PROV_ID"
+    CLEANUP_TYPE="vm"
     ok "VM shell created"
 
     # Import the cloud image as the boot disk
     info "Importing cloud image to disk..."
-    qm set "$PROV_ID" --scsi0 "${PROV_DISK_STORAGE}:0,import-from=${image_path}"
+    qm set "$PROV_ID" --scsi0 "${PROV_DISK_STORAGE}:0,import-from=${image_path},discard=on,iothread=1,ssd=1"
     ok "Disk imported"
 
     # Resize to requested size
@@ -788,12 +1297,14 @@ create_vm() {
     qm set "$PROV_ID" --ide2 "${PROV_DISK_STORAGE}:cloudinit"
 
     # Ensure snippets dir exists
-    mkdir -p /var/lib/vz/snippets
+    mkdir -p "$SNIPPET_DIR"
 
-    # Generate and install custom cloud-init user-data
+    # Generate and install custom cloud-init user-data. The snippet only has to
+    # exist until cloud-init has finished; it is removed again (together with the
+    # cicustom setting that points at it) once the guest reports it is done.
     local snippet_file="pve-provision-${PROV_ID}-userdata.yml"
-    local snippet_path="/var/lib/vz/snippets/${snippet_file}"
-    CLEANUP_FILES+=("$snippet_path")
+    local snippet_path="${SNIPPET_DIR}/${snippet_file}"
+    CLEANUP_SNIPPET="$snippet_path"
 
     generate_cloudinit_userdata > "$snippet_path"
     chmod 600 "$snippet_path"
@@ -810,10 +1321,10 @@ create_vm() {
     qm start "$PROV_ID"
     ok "VM started"
 
-    info "Waiting for cloud-init + guest agent (this may take 1-3 minutes)..."
+    info "Waiting for cloud-init + guest agent (this may take a few minutes)..."
     local elapsed=0
-    local max_wait=180
-    local guest_ip="pending"
+    local max_wait="$AGENT_WAIT_MAX"
+    local guest_ip=""
 
     while (( elapsed < max_wait )); do
         # Try to get IP via guest agent
@@ -828,13 +1339,14 @@ create_vm() {
                 break
             fi
         fi
-        sleep 5
-        (( elapsed += 5 ))
+        sleep "$POLL_SECS"
+        (( elapsed += POLL_SECS ))
         echo -en "\r  ⏳  Waiting... (${elapsed}s / ${max_wait}s)  "
     done
     echo
 
-    if [[ "$guest_ip" == "pending" ]]; then
+    if [[ -z "$guest_ip" ]]; then
+        guest_ip="pending"
         warn "Could not detect IP via guest agent after ${max_wait}s."
         warn "Possible causes:"
         warn "  - cloud-init still running (give it another minute)"
@@ -843,27 +1355,44 @@ create_vm() {
         warn "Debug: qm guest cmd ${PROV_ID} network-get-interfaces"
     fi
 
+    # Wait for cloud-init to finish, then detach the snippet so the VM no longer
+    # depends on anything outside its own config. If we can't confirm it finished,
+    # LEAVE the snippet and cicustom in place: removing only one of them is what
+    # makes a VM fail to start next time.
+    local finished=0
+    if [[ "$guest_ip" != "pending" ]]; then
+        info "Waiting for cloud-init to finish..."
+        local waited=0
+        while (( waited < CLOUDINIT_WAIT_MAX )); do
+            if guest_file_exists "$PROV_ID" /var/lib/cloud/instance/boot-finished; then
+                finished=1
+                break
+            fi
+            sleep "$POLL_SECS"
+            (( waited += POLL_SECS ))
+        done
+    fi
+    if (( finished )); then
+        qm set "$PROV_ID" --delete cicustom
+        rm -f "$snippet_path"
+        CLEANUP_SNIPPET=""
+        ok "Cloud-init finished; user-data snippet and cicustom removed"
+        if [[ "$PROV_KEEP_CLOUD_INIT" == "y" ]]; then
+            warn "Cloud-init left enabled: a later restart re-runs it with default data (SSH host keys are regenerated)."
+        fi
+    else
+        # Keep the snippet: cicustom still points at it. (CLEANUP_SNIPPET stays set so
+        # that it is only removed if a later failure also destroys the VM.)
+        warn "Could not confirm cloud-init finished — snippet and cicustom left in place."
+        warn "Once the VM is up, detach them together:"
+        warn "  qm set ${PROV_ID} --delete cicustom && rm -f ${snippet_path}"
+    fi
+
     # Set notes
     local notes_html
     notes_html=$(generate_notes_html "$guest_ip")
     qm set "$PROV_ID" --description "$notes_html"
     ok "Proxmox notes updated"
-
-    # Background cleanup: wait for cloud-init to finish, then delete the snippet
-    info "Cloud-init snippet will be auto-deleted after boot completes."
-    (
-        sleep 10
-        for _attempt in $(seq 1 36); do  # 36 x 10s = 6 min max
-            if qm guest cmd "$PROV_ID" exec -- test -f /var/lib/cloud/instance/boot-finished 2>/dev/null; then
-                rm -f "$snippet_path" 2>/dev/null
-                break
-            fi
-            sleep 10
-        done
-        # If timed out, remove anyway — cloud-init has had its chance
-        rm -f "$snippet_path" 2>/dev/null || true
-    ) &
-    disown
 
     print_summary "$guest_ip"
 }
@@ -873,19 +1402,16 @@ generate_cloudinit_userdata() {
     root_hash=$(hash_password "$PROV_ROOT_PW")
     sysadmin_hash=$(hash_password "$PROV_SYSADMIN_PW")
 
-    # Build package list
-    local pkg_list="  - util-linux
-  - curl
-  - wget
-  - net-tools
-  - sudo
-  - openssh-server
-  - nano
-  - qemu-guest-agent"
-    [[ "$PROV_OPT_BTOP" == "y" ]] && pkg_list+="
-  - btop"
-    [[ "$PROV_OPT_GIT" == "y" ]] && pkg_list+="
-  - git"
+    # Package list (single source of truth: guest_packages)
+    local pkg_list="" p
+    for p in $(guest_packages install); do
+        pkg_list+="  - ${p}
+"
+    done
+    pkg_list="${pkg_list%$'\n'}"
+
+    # Short hostname + FQDN
+    local short_name="${PROV_HOSTNAME%%.*}" fqdn="$PROV_HOSTNAME"
 
     # Build SSH keys block for sysadmin user
     local ssh_keys_block=""
@@ -895,6 +1421,24 @@ generate_cloudinit_userdata() {
             ssh_keys_block+="
       - ${key}"
         done <<< "$PROV_SSH_KEYS"
+    fi
+
+    # write_files: sshd drop-in (+ apt cache). write_files runs before package install.
+    local write_files
+    write_files="  - path: /etc/ssh/sshd_config.d/00-pve-prov.conf
+    permissions: '0644'
+    content: |
+$(sshd_dropin_content | sed 's/^/      /')"
+    if [[ -n "$PROV_APT_CACHE" ]]; then
+        write_files+="
+  - path: /usr/local/bin/apt-proxy-detect
+    permissions: '0755'
+    content: |
+$(apt_proxy_detect_script "$PROV_APT_CACHE" | sed 's/^/      /')
+  - path: /etc/apt/apt.conf.d/01acng
+    permissions: '0644'
+    content: |
+$(apt_proxy_conf | sed 's/^/      /')"
     fi
 
     # Build gh-cli runcmd block
@@ -909,9 +1453,18 @@ generate_cloudinit_userdata() {
   - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${APT_OPTS} gh"
     fi
 
+    # Run-once tool: switch cloud-init off after this first boot so a later restart
+    # can't re-run it (new instance-id -> regenerated SSH host keys, default user, ...).
+    local disable_ci=""
+    if [[ "$PROV_KEEP_CLOUD_INIT" != "y" ]]; then
+        disable_ci="
+  - touch /etc/cloud/cloud-init.disabled"
+    fi
+
     cat <<CLOUDINIT
 #cloud-config
-hostname: ${PROV_HOSTNAME}
+hostname: ${short_name}
+fqdn: ${fqdn}
 manage_etc_hosts: true
 package_update: true
 package_upgrade: true
@@ -929,6 +1482,9 @@ users:
     hashed_passwd: '${sysadmin_hash}'
 ${ssh_keys_block}
 
+write_files:
+${write_files}
+
 packages:
 ${pkg_list}
 
@@ -937,9 +1493,8 @@ ssh_pwauth: true
 runcmd:
   - systemctl enable qemu-guest-agent
   - systemctl start qemu-guest-agent
-  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
   - systemctl restart ssh || systemctl restart sshd || true${gh_runcmd}
-  - apt-get clean
+  - apt-get clean${disable_ci}
 
 final_message: "pve-provision: cloud-init complete after \$UPTIME seconds"
 CLOUDINIT
@@ -952,18 +1507,25 @@ generate_notes_html() {
     local ip="${1:-pending}"
     local created_at
     created_at=$(date -u '+%Y-%m-%d %H:%M UTC')
-    local type_label
-    [[ "$PROV_TYPE" == "lxc" ]] && type_label="LXC Container" || type_label="Virtual Machine"
+    local type_label cpu_type_row="—"
+    if [[ "$PROV_TYPE" == "lxc" ]]; then
+        type_label="LXC Container"
+    else
+        type_label="Virtual Machine"
+        cpu_type_row="${PROV_CPU_TYPE}"
+    fi
 
     # Build package list for display
-    local pkg_display="util-linux, curl, wget, net-tools, sudo, ssh, nano"
-    [[ "$PROV_TYPE" == "vm" ]] && pkg_display+=", qemu-guest-agent"
-    [[ "$PROV_OPT_BTOP" == "y" ]] && pkg_display+=", btop"
-    [[ "$PROV_OPT_GIT" == "y" ]] && pkg_display+=", git"
-    [[ "$PROV_OPT_GH" == "y" ]] && pkg_display+=", gh"
+    local pkg_display
+    pkg_display=$(guest_packages display | sed 's/ /, /g')
 
     local ssh_info="Password authentication"
     [[ -n "$PROV_SSH_KEYS" ]] && ssh_info="Password + SSH keys (github.com/${PROV_GITHUB_USER})"
+
+    local sysadmin_pw_row=""
+    if [[ "$PROV_SYSADMIN_PW_GENERATED" == "y" ]]; then
+        sysadmin_pw_row="<code style=\"background: #dcfce7; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin-left: 8px;\">${PROV_SYSADMIN_PW}</code>"
+    fi
 
     cat <<'HTMLEOF'
 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; color: #1a1a2e;">
@@ -993,6 +1555,13 @@ HTMLEOF
         <td style="padding: 4px 0;"><strong>🌉 Bridge</strong></td>
         <td style="padding: 4px 0; text-align: right;">${PROV_BRIDGE}</td>
       </tr>
+      <tr>
+        <td style="padding: 4px 0;"><strong>⚡ CPU type</strong></td>
+        <td style="padding: 4px 0; text-align: right;">${cpu_type_row}</td>
+        <td style="padding: 4px 0;"></td>
+        <td style="padding: 4px 0;"><strong>🗄️ Apt cache</strong></td>
+        <td style="padding: 4px 0; text-align: right;">${PROV_APT_CACHE:-none}</td>
+      </tr>
     </table>
   </div>
 
@@ -1010,7 +1579,7 @@ HTMLEOF
       <tr><td style="padding: 3px;"></td></tr>
       <tr>
         <td style="padding: 6px 8px; background: #f0fdf4; border-radius: 4px;" colspan="2">
-          <strong>sysadmin</strong>
+          <strong>sysadmin</strong>${sysadmin_pw_row}
           <span style="color: #166534; font-size: 11px; margin-left: 8px;">✔ sudo · ${ssh_info}</span>
         </td>
       </tr>
@@ -1054,13 +1623,16 @@ print_summary() {
     echo -e "  ${BOLD}IP:${RESET}          ${ip}"
     echo
     echo -e "  ${BOLD}Connect:${RESET}     ${GREEN}ssh sysadmin@${ip}${RESET}"
-    echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}${PROV_ROOT_PW}${RESET} ${DIM}(also in Proxmox notes)${RESET}"
+    echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}${PROV_ROOT_PW}${RESET} ${DIM}(also in Proxmox notes; console login only)${RESET}"
+    if [[ "$PROV_SYSADMIN_PW_GENERATED" == "y" ]]; then
+        echo -e "  ${BOLD}sysadmin PW:${RESET} ${DIM}${PROV_SYSADMIN_PW}${RESET} ${DIM}(generated; also in Proxmox notes)${RESET}"
+    fi
     echo
     divider
     echo -e "  ${DIM}Full details stored in the Proxmox notes tab for this guest.${RESET}"
     echo
 
-    # Clear cleanup trap — we succeeded
+    # Clear cleanup trap state — we succeeded
     CLEANUP_CTID=""
 }
 
@@ -1068,7 +1640,9 @@ print_summary() {
 # MAIN
 # =============================================================================
 main() {
-    clear
+    parse_args "$@"
+
+    if (( ! ASSUME_YES )); then clear 2>/dev/null || true; fi
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
     echo "  ║        Proxmox VE Guest Provisioner          ║"
@@ -1077,6 +1651,7 @@ main() {
     echo -e "${RESET}"
 
     preflight
+    resolve_os_catalog
     collect_input
     confirm_settings
 
@@ -1087,4 +1662,7 @@ main() {
     fi
 }
 
-main "$@"
+# Run only when executed (not when sourced, e.g. by the tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
