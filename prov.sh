@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pve-provision.sh v1.3
+# pve-provision.sh v1.3.1
 # Self-contained Proxmox VE LXC/VM provisioner (Debian + Ubuntu)
 #
 # No external script sourcing. No telemetry. Audit once, run forever.
@@ -18,7 +18,7 @@ shopt -s inherit_errexit
 # =============================================================================
 # CONSTANTS & DEFAULTS
 # =============================================================================
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.3.1"
 
 DEFAULT_HOSTNAME="hostname.lan"
 DEFAULT_CPU=4                    # cores
@@ -581,6 +581,19 @@ check_host_cpu_support() {
         warn "This host's CPU lacks:${missing} (needed by ${want}). The VM may fail to start here."
     fi
     return 0
+}
+
+set_guest_notes() {
+    # Usage: set_guest_notes <pct|qm> <id> <html>
+    # Always run in a UTF-8 locale: under C/POSIX (or no locale at all, as in many
+    # non-login shells) Proxmox stores the emoji bytes as garbage ("������"). The
+    # output is captured: on success it is only noise (the whole HTML echoed back, plus
+    # a harmless "Wide character" warning from Proxmox); on failure the tail is shown.
+    local tool="$1" id="$2" html="$3" out
+    if ! out=$(LC_ALL=C.UTF-8 "$tool" set "$id" --description "$html" 2>&1); then
+        warn "Proxmox refused the notes: $(tail -n 2 <<<"$out")"
+        return 1
+    fi
 }
 
 generate_password() {
@@ -1323,7 +1336,7 @@ configure_lxc_guest() {
 
     # Notes are best effort: the guest works without them.
     local notes_html
-    if notes_html=$(generate_notes_html "$final_ip") && pct set "$id" --description "$notes_html"; then
+    if notes_html=$(generate_notes_html "$final_ip") && set_guest_notes pct "$id" "$notes_html"; then
         ok "Proxmox notes updated"
     else
         warn "Could not write the Proxmox notes. Record the passwords shown below now: they are not stored anywhere else."
@@ -1571,7 +1584,7 @@ create_vm() {
 
     # Notes are best effort: the VM works without them.
     local notes_html
-    if notes_html=$(generate_notes_html "$guest_ip") && qm set "$PROV_ID" --description "$notes_html"; then
+    if notes_html=$(generate_notes_html "$guest_ip") && set_guest_notes qm "$PROV_ID" "$notes_html"; then
         ok "Proxmox notes updated"
     else
         warn "Could not write the Proxmox notes. Record the passwords shown below now: they are not stored anywhere else."
@@ -1926,7 +1939,7 @@ main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
     echo "  ║        Proxmox VE Guest Provisioner          ║"
-    echo "  ║          pve-provision.sh v${SCRIPT_VERSION}               ║"
+    echo "  ║          pve-provision.sh v${SCRIPT_VERSION}             ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${RESET}"
 

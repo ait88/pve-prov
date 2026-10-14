@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.1
+
+- **Proxmox notes showed garbage (`������`) instead of the emoji** when the script was run from a shell without a UTF-8 locale: under `C`/`POSIX` (or no locale, common in non-login shells and automation) `qm set --description` stores the bytes mangled. The notes are now always written in `LC_ALL=C.UTF-8`, and the command's output (the whole notes HTML plus a harmless Proxmox "Wide character" warning) is no longer echoed to the terminal. Verified on a real node from a shell with no locale.
+- README cut by more than half (10.0 KB to 4.3 KB): same warning, install line, behaviours and exit codes, less prose.
+
 ## v1.3
 
 Fixes and features from [#4](https://github.com/ait88/pve-prov/issues/4). Debian and Ubuntu only.

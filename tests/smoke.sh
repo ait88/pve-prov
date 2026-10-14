@@ -151,6 +151,7 @@ case "$1" in
         if [[ "$*" == *"--description"* ]]; then
             [[ "${DESC_FAIL:-0}" == "1" ]] && exit 1
             echo "$*" > "$S/desc-$id"
+            echo "${LC_ALL:-unset}" > "$S/desc-locale-$id"
         fi ;;
     start)
         id="$2"
@@ -218,6 +219,7 @@ case "$1" in
         if [[ "$*" == *"--description"* ]]; then
             [[ "${DESC_FAIL:-0}" == "1" ]] && exit 1
             echo "$*" > "$S/desc-$2"
+            echo "${LC_ALL:-unset}" > "$S/desc-locale-$2"
         fi ;;
     destroy)
         [[ "${DESTROY_FAIL:-0}" == "1" ]] && exit 1
@@ -430,6 +432,17 @@ run_prov --yes --type vm --os debian --id 930 --hostname t.lan --bridge lo --sto
 check "no password given with --yes: generated" test "$rc" -eq 0
 check "…shown once in the summary"              out_has 'sysadmin PW:'
 check "…and stored in the Proxmox notes"        grep -q 'description' "$T/state/desc-930"
+
+echo "== Notes are written in a UTF-8 locale whatever the caller's locale is"
+# Under C/POSIX Proxmox stores the emoji in the notes as garbage ("������")
+LC_ALL=C run_prov "${VM_ARGS[@]}"
+check "VM notes: written with LC_ALL=C.UTF-8 even when the caller has LC_ALL=C" test "$(cat "$T/state/desc-locale-930" 2>/dev/null)" = "C.UTF-8"
+env -u LANG -u LC_ALL run_prov "${VM_ARGS[@]}"
+check "VM notes: …and when the caller has no locale at all"   test "$(cat "$T/state/desc-locale-930" 2>/dev/null)" = "C.UTF-8"
+LC_ALL=POSIX run_prov "${CT_ARGS[@]}"
+check "CT notes: written with LC_ALL=C.UTF-8 even when the caller has LC_ALL=POSIX" test "$(cat "$T/state/desc-locale-931" 2>/dev/null)" = "C.UTF-8"
+DESC_FAIL=1 run_prov "${VM_ARGS[@]}"
+check "a refused notes update is reported, not hidden"          out_has 'Proxmox refused the notes|Could not write the Proxmox notes'
 
 echo "== Environment is not trusted for internal state"
 PROV_SSH_KEYS="ssh-ed25519 AAAAevilevilevil evil" run_prov "${VM_ARGS[@]}"
