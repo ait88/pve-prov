@@ -74,6 +74,10 @@ Proxmox's default (`kvm64`) is a very old baseline: no SSE4/AVX. Many prebuilt b
 
 The ID is refused if it is used anywhere in the cluster, **or** if any active storage still holds disks or backups for it (including Proxmox Backup Server), so a new guest can't collide with an old one's volumes or a future restore.
 
+- **It fails closed.** If a storage can't be listed (for example a PBS datastore that times out), the ID is refused and the storage is named, because that storage might hold backups for it. `--ignore-storage NAME` (repeatable) skips a storage you know is irrelevant. Storages that aren't active are listed in a warning up front.
+- Only guest-owned content counts (disks, container volumes, backups). Snippet and import files on a storage are not treated as belonging to an ID.
+- The default ID is the lowest free one, **stepping up past IDs that still have backups**, so `--yes` without `--id` keeps working on clusters with a long backup history.
+
 ### Apt cache (optional)
 
 Offers to point the guest at an apt-cacher-ng instance (default `apt-cacher-ng.lan:3142`; the prompt defaults to *yes* only when that name resolves from the PVE host). It uses `Proxy-Auto-Detect` with a 1 s probe and falls back to direct, so an unreachable cache never breaks `apt`. HTTPS repositories bypass it (apt-cacher-ng refuses `CONNECT`).
@@ -81,6 +85,8 @@ Offers to point the guest at an apt-cacher-ng instance (default `apt-cacher-ng.l
 ### VM first boot and cloud-init
 
 Cloud-init configures the VM once. When it reports finished, the script removes its user-data snippet **and** the `cicustom` setting together, so the VM never depends on a file on the host. If the script can't confirm cloud-init finished, it leaves both in place and tells you the command to remove them.
+
+Before it reports success, the script also checks that the first-boot steps it asked for really worked. They run from one small script inside the guest (starting the guest agent, `sshd` configuration and verification, the apt mirror rewrite, the GitHub CLI), which records any failure and only writes a success marker if every step passed. "Cloud-init finished" alone proves nothing, because a failed line in a plain cloud-init `runcmd` is invisible.
 
 **Cloud-init is then disabled inside the guest by default** (`/etc/cloud/cloud-init.disabled`).
 
@@ -103,7 +109,19 @@ bash prov.sh --yes --type vm --os debian --id 930 --hostname build.lan \
   --storage local-zfs --sysadmin-password-file ./pw --github-user octocat
 ```
 
-Run `bash prov.sh --help` for all flags. With `--yes` and no password supplied, random `sysadmin` and `root` passwords are generated and stored in the Proxmox notes.
+Run `bash prov.sh --help` for all flags.
+
+**Exit codes** (so automation can tell "done" from "done, but look"):
+
+| Code | Meaning |
+|---|---|
+| 0 | guest provisioned and verified |
+| 1 | error or refusal; a half-built guest from this run is removed |
+| 2 | bad usage |
+| 3 | VM built, but cloud-init completion could not be confirmed; the snippet and `cicustom` were left in place and the command to detach them is printed (and saved in the Proxmox notes) |
+| 4 | VM built and cloud-init finished, but a first-boot step failed; the failed steps are named |
+
+If provisioning fails or is interrupted after the guest was created, the guest is destroyed only if it carries the `pve-prov` tag, and its cloud-init snippet is deleted only if the guest is really gone. This also holds when the terminal or SSH session disappears mid-run. With `--yes` and no password supplied, random `sysadmin` and `root` passwords are generated and stored in the Proxmox notes.
 
 ## Development
 

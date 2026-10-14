@@ -11,6 +11,9 @@
 # Tested on:    Proxmox VE 8.x / 9.x
 # =============================================================================
 set -euo pipefail
+# Without this, a failing command inside $(...) does not abort the caller, so a
+# helper that prints an error and exits would be silently ignored.
+shopt -s inherit_errexit
 
 # =============================================================================
 # CONSTANTS & DEFAULTS
@@ -40,6 +43,9 @@ APT_OPTS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 
 # Cloud image cache directory (override with PROV_CACHE_DIR)
 CLOUD_IMG_DIR="${PROV_CACHE_DIR:-/var/lib/vz/template/cloud}"
+
+# Cluster-wide guest configs (one directory per node). Overridable for testing.
+PVE_NODES_DIR="${PROV_PVE_NODES_DIR:-/etc/pve/nodes}"
 
 # Where cloud-init user-data snippets live (the "local" storage's snippets dir)
 SNIPPET_DIR="${PROV_SNIPPET_DIR:-/var/lib/vz/snippets}"
@@ -118,25 +124,44 @@ Software / access:
   --keep-cloud-init         VMs: leave cloud-init enabled after first boot
                             (default: disabled, so a later reboot can't re-run it)
 
+Safety:
+  --ignore-storage NAME     do not check this storage for leftover volumes/backups of the
+                            chosen ID (repeatable). Only for storages you know are
+                            irrelevant: if a storage can't be listed, the ID is refused.
+
 Other:
   -y, --yes                 non-interactive, skip the confirmation
   --version                 print version
   -h, --help                this help
+
+Exit codes:
+  0  guest provisioned and verified
+  1  error or refusal (nothing left behind: a half-built guest is removed)
+  2  bad usage
+  3  VM built, but cloud-init completion could not be confirmed: its snippet and
+     cicustom were left in place; the command to detach them is printed
+  4  VM built and cloud-init finished, but a first-boot step failed (named in the output)
 EOF
 }
 
 # =============================================================================
 # ARGUMENT PARSING
 # =============================================================================
-# All PROV_* settings start empty; empty means "ask (or default)".
+# User-facing PROV_* settings may be preset by flag or environment variable;
+# empty means "ask (or default)".
 PROV_VARS=(PROV_TYPE PROV_OS PROV_ID PROV_HOSTNAME PROV_CPU PROV_CPU_TYPE PROV_RAM PROV_DISK
     PROV_BRIDGE PROV_DISK_STORAGE PROV_TPL_STORAGE PROV_OPT_BTOP PROV_OPT_GIT PROV_OPT_GH
-    PROV_SYSADMIN_PW PROV_GITHUB_USER PROV_SSH_KEYS PROV_ROOT_PW PROV_APT_CACHE
-    PROV_KEEP_CLOUD_INIT PROV_SYSADMIN_PW_GENERATED)
+    PROV_SYSADMIN_PW PROV_GITHUB_USER PROV_APT_CACHE PROV_KEEP_CLOUD_INIT PROV_IGNORE_STORAGES)
 for _v in "${PROV_VARS[@]}"; do
     printf -v "$_v" '%s' "${!_v:-}"
 done
 unset _v
+# Internal state: always starts empty, never read from the environment (an
+# imported PROV_SSH_KEYS would bypass key validation, for example).
+PROV_SSH_KEYS="" PROV_ROOT_PW="" PROV_SYSADMIN_PW_GENERATED="" PROV_KEYS_FAILED=""
+# Outcome of a VM first boot: ok | degraded | unconfirmed (drives banner + exit code)
+PROV_STATUS="ok"
+PROV_DETACH_CMD=""
 
 parse_args() {
     need_arg() {
@@ -176,9 +201,21 @@ parse_args() {
                 PROV_SYSADMIN_PW="$(head -n1 "$2")"
                 shift ;;
             --keep-cloud-init)  PROV_KEEP_CLOUD_INIT="y" ;;
+            --ignore-storage)   need_arg "$@"; PROV_IGNORE_STORAGES+=" $2"; shift ;;
             *)                  err "Unknown option: $1 (see --help)"; exit 2 ;;
         esac
         shift
+    done
+
+    # Normalise y/n style values from flags or the environment (1/yes/true -> y)
+    case "${PROV_KEEP_CLOUD_INIT,,}" in
+        y|yes|1|true)  PROV_KEEP_CLOUD_INIT="y" ;;
+        ""|n|no|0|false) PROV_KEEP_CLOUD_INIT="n" ;;
+        *) err "Invalid PROV_KEEP_CLOUD_INIT: ${PROV_KEEP_CLOUD_INIT} (use y or n)"; exit 2 ;;
+    esac
+    local s
+    for s in $PROV_IGNORE_STORAGES; do
+        [[ "$s" =~ ^[A-Za-z0-9._-]+$ ]] || { err "Invalid storage name for --ignore-storage: $s"; exit 2; }
     done
 }
 
@@ -235,9 +272,9 @@ prompt_secret() {
     local pw1 pw2
     while true; do
         echo -en "  ${BOLD}${label}${RESET}: " >/dev/tty
-        read -rs pw1 </dev/tty; echo >/dev/tty
+        IFS= read -rs pw1 </dev/tty; echo >/dev/tty
         echo -en "  ${BOLD}Confirm${RESET}: " >/dev/tty
-        read -rs pw2 </dev/tty; echo >/dev/tty
+        IFS= read -rs pw2 </dev/tty; echo >/dev/tty
         if [[ "$pw1" == "$pw2" ]]; then
             if [[ ${#pw1} -lt 5 ]]; then
                 warn "Password must be at least 5 characters. Try again."
@@ -295,30 +332,45 @@ CLEANUP_FILES=()
 
 cleanup() {
     local exit_code=$?
+    # A cleanup trap must run to the end whatever fails inside it. Under set -e a
+    # failing message (dead terminal, closed stdout) would otherwise abort the trap
+    # before the destroy.
+    set +e
+    # If the terminal or pipe we were writing to is gone, a message would raise SIGPIPE
+    # and kill this trap before the destroy. Ignore it: writes then just fail quietly.
+    trap '' PIPE
     if [[ $exit_code -ne 0 && -n "$CLEANUP_CTID" ]]; then
+        local tool="pct"
+        [[ "$CLEANUP_TYPE" == "vm" ]] && tool="qm"
+        local conf cfg_rc gone=0
+        conf=$("$tool" config "$CLEANUP_CTID" 2>&1)
+        cfg_rc=$?
         echo
         warn "Script failed (exit $exit_code). Cleaning up..."
-        # Only ever destroy a guest that we created (carries our tag).
-        local conf=""
-        if [[ "$CLEANUP_TYPE" == "lxc" ]]; then
-            conf=$(pct config "$CLEANUP_CTID" 2>/dev/null || true)
-        elif [[ "$CLEANUP_TYPE" == "vm" ]]; then
-            conf=$(qm config "$CLEANUP_CTID" 2>/dev/null || true)
-        fi
-        if grep -qE "^tags:.*${GUEST_TAG}" <<<"$conf"; then
-            if [[ "$CLEANUP_TYPE" == "lxc" ]]; then
-                pct stop "$CLEANUP_CTID" 2>/dev/null || true
-                pct destroy "$CLEANUP_CTID" --purge 2>/dev/null || true
+        # Only ever destroy a guest that we created (carries our tag, matched exactly).
+        if (( cfg_rc != 0 )); then
+            warn "Cannot read the config of ${CLEANUP_TYPE} ${CLEANUP_CTID} (${conf}); NOT destroying it."
+        elif grep -qE "^tags:[[:space:]]*(.*[;, ])?${GUEST_TAG}([;, ].*)?$" <<<"$conf"; then
+            "$tool" stop "$CLEANUP_CTID" >/dev/null 2>&1
+            "$tool" destroy "$CLEANUP_CTID" --purge >/dev/null 2>&1
+            # Judge the outcome by whether the guest is really gone, not by exit codes.
+            if "$tool" config "$CLEANUP_CTID" >/dev/null 2>&1; then
+                warn "Could NOT destroy ${CLEANUP_TYPE} ${CLEANUP_CTID}. Remove it by hand: ${tool} destroy ${CLEANUP_CTID} --purge"
             else
-                qm stop "$CLEANUP_CTID" 2>/dev/null || true
-                qm destroy "$CLEANUP_CTID" --purge 2>/dev/null || true
+                gone=1
+                ok "Cleaned up partial ${CLEANUP_TYPE^^} ${CLEANUP_CTID}"
             fi
-            ok "Cleaned up partial ${CLEANUP_TYPE^^} ${CLEANUP_CTID}"
         else
             warn "Guest ${CLEANUP_CTID} is missing the '${GUEST_TAG}' tag — NOT destroying it."
         fi
+        # The snippet may only go if the guest that points at it (cicustom) is gone;
+        # otherwise that guest could no longer start.
         if [[ -n "$CLEANUP_SNIPPET" ]]; then
-            rm -f "$CLEANUP_SNIPPET" 2>/dev/null || true
+            if (( gone )); then
+                rm -f "$CLEANUP_SNIPPET"
+            else
+                warn "Kept ${CLEANUP_SNIPPET}: the surviving guest may still reference it (cicustom)."
+            fi
         fi
     fi
     for f in "${CLEANUP_FILES[@]}"; do
@@ -332,6 +384,11 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+# A bash killed by SIGPIPE (the terminal or pipe we print to went away) dies at once
+# WITHOUT running its EXIT trap, leaving a half-built guest behind. Turn it into a
+# normal exit so cleanup always runs. (A handler, not 'ignore': the pipelines inside
+# this script, e.g. `... | head -1`, must keep their usual behaviour.)
+trap 'exit 141' PIPE
 
 # =============================================================================
 # PRE-FLIGHT CHECKS
@@ -371,6 +428,13 @@ preflight() {
     done
     ok "All required tools available"
 
+    # Storages that aren't active can't be searched for an ID's leftover volumes/backups
+    local inactive
+    inactive=$(pvesm status 2>/dev/null | awk 'NR>1 && $3!="active" {print $1}' | tr '\n' ' ') || inactive=""  # advisory only; find_id_leftovers fails closed if storage can't be listed
+    if [[ -n "${inactive// /}" ]]; then
+        warn "Not checked for ID conflicts (storage not active): ${inactive}"
+    fi
+
     # Interactive mode needs a terminal
     if (( ! ASSUME_YES )) && ! { : </dev/tty; } 2>/dev/null; then
         err "No terminal available for prompts. Use --yes (and flags) to run non-interactively."
@@ -383,18 +447,34 @@ preflight() {
 # =============================================================================
 
 get_next_free_id() {
-    pvesh get /cluster/nextid 2>/dev/null || echo "100"
+    pvesh get /cluster/nextid 2>/dev/null || {
+        err "Could not ask Proxmox for the next free ID (cluster not quorate?). Pass --id."
+        exit 1
+    }
 }
 
-# Volumes/backups belonging to <id> on any active storage (guest disks left
-# behind by an earlier guest, backups on PBS/dir storage, ...).
+# Looks for volumes/backups belonging to <id> on every active storage (disks left
+# behind by an earlier guest, backups on PBS/dir storage, ...). Prints one line per
+# finding: "L <volid>" for a leftover, "E <storage>: <reason>" for a storage that
+# could not be listed (so the caller can fail closed rather than assume it is empty).
+#
+# Only guest-owned content types count. For snippets/import files, `pvesm list
+# --vmid` returns every file whatever the ID, which would make every ID look taken.
 find_id_leftovers() {
-    local id="$1" s out
+    local id="$1" s out rc storages
+    storages=$(pvesm status 2>&1) || { echo "E pvesm status: ${storages//$'\n'/ }"; return 0; }
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        out=$(timeout 20 pvesm list "$s" --vmid "$id" 2>/dev/null | awk 'NR>1 {print $1}') || true
-        [[ -n "$out" ]] && echo "$out"
-    done < <(pvesm status 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}')
+        if [[ " $PROV_IGNORE_STORAGES " == *" $s "* ]]; then continue; fi
+        rc=0
+        out=$(timeout 60 pvesm list "$s" --vmid "$id" 2>&1) || rc=$?
+        if (( rc != 0 )); then
+            out="${out:-no output; exit ${rc}, timed out after 60s?}"
+            echo "E ${s}: $(head -c 200 <<<"${out//$'\n'/ }")"
+            continue
+        fi
+        awk 'NR>1 && ($3=="images" || $3=="rootdir" || $3=="backup") {print "L " $1}' <<<"$out"
+    done < <(awk 'NR>1 && $3=="active" {print $1}' <<<"$storages")
     return 0
 }
 
@@ -406,8 +486,8 @@ validate_id() {
         return 1
     fi
     # Configs on any cluster node
-    if compgen -G "/etc/pve/nodes/*/qemu-server/${id}.conf" >/dev/null \
-        || compgen -G "/etc/pve/nodes/*/lxc/${id}.conf" >/dev/null; then
+    if compgen -G "${PVE_NODES_DIR}/*/qemu-server/${id}.conf" >/dev/null \
+        || compgen -G "${PVE_NODES_DIR}/*/lxc/${id}.conf" >/dev/null; then
         VALIDATION_MSG="ID ${id} is already used by a VM or container in this cluster."
         return 1
     fi
@@ -417,8 +497,10 @@ validate_id() {
         return 1
     fi
     # Orphaned disks and backups
-    local leftovers
-    leftovers=$(find_id_leftovers "$id")
+    local scan leftovers errors
+    scan=$(find_id_leftovers "$id")
+    leftovers=$(sed -n 's/^L //p' <<<"$scan")
+    errors=$(sed -n 's/^E //p' <<<"$scan")
     if [[ -n "$leftovers" ]]; then
         local n shown
         n=$(grep -c . <<<"$leftovers")
@@ -428,7 +510,34 @@ validate_id() {
 ${shown}"
         return 1
     fi
+    # A storage we could not read might hold backups for this ID (a Proxmox Backup
+    # Server datastore that times out is exactly that case). Fail closed.
+    if [[ -n "$errors" ]]; then
+        # shellcheck disable=SC2001  # per-line indent of multi-line text
+        VALIDATION_MSG="Cannot confirm ID ${id} is free: these storages could not be checked for leftover volumes/backups:
+$(sed 's/^/        /' <<<"$errors")
+        Fix the storage, or skip it with --ignore-storage NAME if it cannot hold this ID's data."
+        return 2
+    fi
     return 0
+}
+
+suggest_free_id() {
+    # The lowest unused ID is often a deleted guest's that still has backups, so
+    # step up from it to the first ID that passes every check.
+    local id tries=0 rc
+    id=$(get_next_free_id)
+    while (( tries < 50 )); do
+        rc=0
+        validate_id "$id" || rc=$?
+        if (( rc == 0 )); then echo "$id"; return 0; fi
+        if (( rc == 2 )); then break; fi   # cannot tell; don't hammer the storages
+        local why="${VALIDATION_MSG%%$'\n'*}"
+        info "ID ${id} is not usable (${why%:}); trying the next one" >&2
+        id=$((id + 1))
+        tries=$((tries + 1))
+    done
+    echo "$id"
 }
 
 is_posint()      { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
@@ -479,8 +588,9 @@ generate_password() {
 }
 
 hash_password() {
-    # SHA-512 hash for cloud-init / chpasswd
-    openssl passwd -6 "$1"
+    # SHA-512 hash for cloud-init / chpasswd. Read from stdin: as an argument a password
+    # starting with "-" is parsed as an option, and it would show up in `ps`.
+    openssl passwd -6 -stdin <<<"$1"
 }
 
 detect_storage() {
@@ -564,17 +674,24 @@ select_storage() {
 }
 
 fetch_github_keys() {
-    local username="$1"
-    local keys
-    keys=$(curl -fsSL --connect-timeout 10 --max-time 15 \
-        "https://github.com/${username}.keys" 2>/dev/null || true)
-    if [[ -z "$keys" ]]; then
-        warn "No SSH keys found for GitHub user '${username}'"
+    # Prints the user's well-formed public keys, one per line. Returns 1 (with a
+    # warning saying why) if none could be obtained.
+    local username="$1" keys="" rc=0
+    if ! [[ "$username" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]]; then
+        warn "'${username}' is not a valid GitHub username"
         return 1
     fi
-    # Validate they look like SSH keys
-    if ! echo "$keys" | head -1 | grep -qE '^(ssh-|ecdsa-|sk-)'; then
-        warn "Response doesn't look like SSH keys for '${username}'"
+    keys=$(curl -fsSL --connect-timeout 10 --max-time 15 \
+        "https://github.com/${username}.keys" 2>/dev/null) || rc=$?
+    if (( rc != 0 )); then
+        warn "Could not fetch github.com/${username}.keys (curl exit ${rc}; 22 = HTTP error such as unknown user or rate limit)"
+        return 1
+    fi
+    # Keep only well-formed key lines: they go into a root-owned cloud-init file,
+    # so anything else in the response must not get through.
+    keys=$(grep -E '^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-[a-z0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/=]+( [^[:cntrl:]]*)?$' <<<"$keys") || true
+    if [[ -z "$keys" ]]; then
+        warn "github.com/${username}.keys contained no valid SSH public keys"
         return 1
     fi
     echo "$keys"
@@ -829,8 +946,10 @@ collect_input() {
 
     # --- ID ---
     divider
-    local suggested_id
-    suggested_id=$(get_next_free_id)
+    local suggested_id=""
+    if [[ -z "$PROV_ID" ]]; then
+        suggested_id=$(suggest_free_id)
+    fi
     prompt_valid PROV_ID "Guest ID (100+)" "$suggested_id" validate_id "Invalid or already-used ID."
     ok "ID: ${PROV_ID}"
 
@@ -936,17 +1055,27 @@ collect_input() {
     fi
 
     divider
+    local keys_requested=0
+    [[ -n "$PROV_GITHUB_USER" ]] && keys_requested=1
     if [[ -z "$PROV_GITHUB_USER" && "$ASSUME_YES" -eq 0 ]]; then
         if prompt_yesno "Import SSH keys from GitHub?" "y"; then
             prompt "GitHub username" "" PROV_GITHUB_USER
         fi
     fi
-    if [[ -n "$PROV_GITHUB_USER" && -z "$PROV_SSH_KEYS" ]]; then
-        PROV_SSH_KEYS=$(fetch_github_keys "$PROV_GITHUB_USER") || true
-        if [[ -n "$PROV_SSH_KEYS" ]]; then
+    if [[ -n "$PROV_GITHUB_USER" ]]; then
+        if PROV_SSH_KEYS=$(fetch_github_keys "$PROV_GITHUB_USER"); then
             local key_count
             key_count=$(echo "$PROV_SSH_KEYS" | wc -l)
             ok "Fetched ${key_count} SSH key(s) from github.com/${PROV_GITHUB_USER}"
+        else
+            PROV_SSH_KEYS=""
+            PROV_KEYS_FAILED="y"
+            # Asked for explicitly (flag/env) = a requirement: don't build a guest the
+            # caller may be unable to log in to. Typed at the prompt = shown in the review.
+            if (( keys_requested )); then
+                err "SSH key import from GitHub was requested but failed. Fix it, or drop --github-user to continue with password login only."
+                exit 1
+            fi
         fi
     fi
 }
@@ -970,6 +1099,7 @@ confirm_settings() {
     echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}(random — stored in notes, console login only)${RESET}"
     echo -e "  ${BOLD}sysadmin:${RESET}    password auth + sudo"
     [[ -n "$PROV_SSH_KEYS" ]] && echo -e "  ${BOLD}SSH Keys:${RESET}    from github.com/${PROV_GITHUB_USER}"
+    [[ "$PROV_KEYS_FAILED" == "y" ]] && echo -e "  ${BOLD}SSH Keys:${RESET}    ${RED}NONE — GitHub import failed; password login only${RESET}"
     echo -e "  ${BOLD}Packages:${RESET}    ${DIM}$(guest_packages display)${RESET}"
     echo
 
@@ -1151,11 +1281,18 @@ configure_lxc_guest() {
     info "Configuring SSH..."
     pct exec "$id" -- mkdir -p /etc/ssh/sshd_config.d >> "$PROVISION_LOG" 2>&1
     sshd_dropin_content | lxc_push_file "$id" 0644 /etc/ssh/sshd_config.d/00-pve-prov.conf
+    # Verified, not assumed: valid config, service really running, and the settings we
+    # promise actually in effect (a conflicting earlier drop-in would win otherwise).
     lxc_exec "$id" "SSH configuration" '
-        systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
+        mkdir -p /run/sshd
+        sshd -t
+        systemctl enable ssh 2>/dev/null || systemctl enable sshd
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd
+        systemctl is-active --quiet ssh || systemctl is-active --quiet sshd
+        sshd -T | grep -qix "permitrootlogin no"
+        sshd -T | grep -qix "passwordauthentication yes"
     '
-    ok "SSH configured (password auth enabled, root login disabled)"
+    ok "SSH configured and verified (password auth enabled, root login disabled)"
 
     # Import SSH keys if provided — use pct push to avoid heredoc expansion issues
     if [[ -n "$PROV_SSH_KEYS" ]]; then
@@ -1178,13 +1315,19 @@ configure_lxc_guest() {
 
     # Get the actual IP (may have changed after SSH restart)
     local final_ip
-    final_ip=$(pct exec "$id" -- hostname -I 2>/dev/null | awk '{print $1}') || final_ip="$ip"
+    final_ip=$(pct exec "$id" -- hostname -I 2>/dev/null | awk '{print $1}') || final_ip=""
+    [[ -n "$final_ip" ]] || final_ip="$ip"
 
-    # Set notes
+    # The container is fully provisioned. From here on a failure must never destroy it.
+    CLEANUP_CTID=""
+
+    # Notes are best effort: the guest works without them.
     local notes_html
-    notes_html=$(generate_notes_html "$final_ip")
-    pct set "$id" --description "$notes_html"
-    ok "Proxmox notes updated"
+    if notes_html=$(generate_notes_html "$final_ip") && pct set "$id" --description "$notes_html"; then
+        ok "Proxmox notes updated"
+    else
+        warn "Could not write the Proxmox notes. Record the passwords shown below now: they are not stored anywhere else."
+    fi
 
     # Done!
     print_summary "$final_ip"
@@ -1375,6 +1518,7 @@ create_vm() {
     # depends on anything outside its own config. If we can't confirm it finished,
     # LEAVE the snippet and cicustom in place: removing only one of them is what
     # makes a VM fail to start next time.
+    PROV_DETACH_CMD="qm set ${PROV_ID} --delete cicustom && rm -f ${snippet_path}"
     local finished=0
     if [[ "$guest_ip" != "pending" ]]; then
         info "Waiting for cloud-init to finish..."
@@ -1389,28 +1533,66 @@ create_vm() {
         done
     fi
     if (( finished )); then
-        qm set "$PROV_ID" --delete cicustom
-        rm -f "$snippet_path"
-        CLEANUP_SNIPPET=""
-        ok "Cloud-init finished; user-data snippet and cicustom removed"
+        # cloud-init is done, so the snippet is no longer needed whatever happened in it.
+        # Delete cicustom first and confirm it is really gone before removing the file.
+        local vm_conf=""
+        if qm set "$PROV_ID" --delete cicustom >/dev/null && vm_conf=$(qm config "$PROV_ID") \
+            && ! grep -q '^cicustom:' <<<"$vm_conf"; then
+            rm -f "$snippet_path"
+            CLEANUP_SNIPPET=""
+            ok "Cloud-init finished; user-data snippet and cicustom removed"
+        else
+            PROV_STATUS="unconfirmed"
+            warn "Cloud-init finished, but cicustom could not be removed — snippet kept so the VM can still start."
+        fi
         if [[ "$PROV_KEEP_CLOUD_INIT" == "y" ]]; then
             warn "Cloud-init left enabled: a later restart re-runs it with default data (SSH host keys are regenerated)."
+        fi
+        # "cloud-init finished" only means it ran to the end. Our own first-boot script
+        # records whether every step we asked for actually worked.
+        if ! guest_file_exists "$PROV_ID" /var/lib/cloud/pve-prov.ok; then
+            [[ "$PROV_STATUS" == "ok" ]] && PROV_STATUS="degraded"
+            local failed_steps
+            failed_steps=$(guest_failed_steps "$PROV_ID")
+            warn "Cloud-init finished, but not every first-boot step succeeded: ${failed_steps:-unknown}"
+            warn "Inspect /var/log/cloud-init-output.log inside the VM (console or SSH)."
         fi
     else
         # Keep the snippet: cicustom still points at it. (CLEANUP_SNIPPET stays set so
         # that it is only removed if a later failure also destroys the VM.)
+        PROV_STATUS="unconfirmed"
         warn "Could not confirm cloud-init finished — snippet and cicustom left in place."
         warn "Once the VM is up, detach them together:"
-        warn "  qm set ${PROV_ID} --delete cicustom && rm -f ${snippet_path}"
+        warn "  ${PROV_DETACH_CMD}"
     fi
 
-    # Set notes
+    # The VM is built. From here on a failure must never destroy it.
+    CLEANUP_CTID=""
+
+    # Notes are best effort: the VM works without them.
     local notes_html
-    notes_html=$(generate_notes_html "$guest_ip")
-    qm set "$PROV_ID" --description "$notes_html"
-    ok "Proxmox notes updated"
+    if notes_html=$(generate_notes_html "$guest_ip") && qm set "$PROV_ID" --description "$notes_html"; then
+        ok "Proxmox notes updated"
+    else
+        warn "Could not write the Proxmox notes. Record the passwords shown below now: they are not stored anywhere else."
+    fi
 
     print_summary "$guest_ip"
+    # Distinct exit codes so automation can tell "done" from "done but check it"
+    case "$PROV_STATUS" in
+        degraded)    exit 4 ;;
+        unconfirmed) exit 3 ;;
+    esac
+}
+
+guest_failed_steps() {
+    # Names of the first-boot steps that failed, as recorded by our first-boot script.
+    # `qm guest exec` answers with JSON; the file content is in "out-data".
+    local out
+    out=$(qm guest exec "$1" -- cat /var/lib/cloud/pve-prov.failed 2>/dev/null) || return 0
+    tr -d '\n' <<<"$out" \
+        | sed -n 's/.*"out-data"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed 's/\\n//g; s/^ *//; s/ *$//'
 }
 
 generate_cloudinit_userdata() {
@@ -1429,22 +1611,29 @@ generate_cloudinit_userdata() {
     # Short hostname + FQDN
     local short_name="${PROV_HOSTNAME%%.*}" fqdn="$PROV_HOSTNAME"
 
-    # Build SSH keys block for sysadmin user
-    local ssh_keys_block=""
+    # Build SSH keys block for sysadmin user. Each key is single-quoted: a comment
+    # containing ": " or " #" would otherwise turn the line into a YAML mapping or
+    # truncate it.
+    local ssh_keys_block="" sq="'"
     if [[ -n "$PROV_SSH_KEYS" ]]; then
         ssh_keys_block="    ssh_authorized_keys:"
         while IFS= read -r key; do
             ssh_keys_block+="
-      - ${key}"
+      - '${key//$sq/$sq$sq}'"
         done <<< "$PROV_SSH_KEYS"
     fi
 
-    # write_files: sshd drop-in (+ apt cache). write_files runs before package install.
+    # write_files: sshd drop-in, first-boot script (+ apt cache). write_files runs
+    # before the package install.
     local write_files
     write_files="  - path: /etc/ssh/sshd_config.d/00-pve-prov.conf
     permissions: '0644'
     content: |
-$(sshd_dropin_content | sed 's/^/      /')"
+$(sshd_dropin_content | sed 's/^/      /')
+  - path: /usr/local/sbin/pve-prov-firstboot
+    permissions: '0700'
+    content: |
+$(firstboot_script | sed 's/^/      /')"
     if [[ -n "$PROV_APT_CACHE" ]]; then
         write_files+="
   - path: /usr/local/bin/apt-proxy-detect
@@ -1457,16 +1646,14 @@ $(apt_proxy_detect_script "$PROV_APT_CACHE" | sed 's/^/      /')
 $(apt_proxy_conf | sed 's/^/      /')"
     fi
 
-    # With an apt cache, the distro mirrors must be plain http (see apt_https_to_http_cmd).
-    # Editing the files early is not enough: Debian's cloud-init regenerates
-    # /etc/apt/mirrors/*.list in its config stage (generate_mirrorlists), overwriting
-    # the edit. So (1) tell cloud-init to generate http mirrors, so the first-boot
-    # upgrade uses the cache too, and (2) rewrite again in runcmd, after cloud-init is
-    # done, so the final state is right whatever generated the files.
-    local apt_block="" cache_runcmd=""
-    if [[ -n "$PROV_APT_CACHE" ]]; then
-        if [[ "${OS_FAMILY[$PROV_OS]}" == "debian" ]]; then
-            apt_block="
+    # With an apt cache on Debian, tell cloud-init to generate http mirrors: Debian's
+    # cloud-init regenerates /etc/apt/mirrors/*.list in its config stage
+    # (generate_mirrorlists), so editing the files early gets overwritten. This makes
+    # the first-boot upgrade use the cache; the first-boot script then rewrites any
+    # remaining https mirrors so the final state is right whatever generated them.
+    local apt_block=""
+    if [[ -n "$PROV_APT_CACHE" && "${OS_FAMILY[$PROV_OS]}" == "debian" ]]; then
+        apt_block="
 apt:
   primary:
     - arches: [default]
@@ -1475,36 +1662,14 @@ apt:
     - arches: [default]
       uri: http://deb.debian.org/debian-security
 "
-        fi
-        cache_runcmd="
-  - |
-$(apt_https_to_http_cmd | sed 's/^/    /')"
     fi
 
-    # Build gh-cli runcmd block
-    local gh_runcmd=""
-    if [[ "$PROV_OPT_GH" == "y" ]]; then
-        gh_runcmd="
-  - mkdir -p -m 755 /etc/apt/keyrings
-  - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
-  - chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-  - echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" > /etc/apt/sources.list.d/github-cli.list
-  - apt-get update -qq
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${APT_OPTS} gh"
-    fi
-
-    # Run-once tool: switch cloud-init off after this first boot so a later restart
-    # can't re-run it (new instance-id -> regenerated SSH host keys, default user, ...).
-    local disable_ci=""
-    if [[ "$PROV_KEEP_CLOUD_INIT" != "y" ]]; then
-        disable_ci="
-  - touch /etc/cloud/cloud-init.disabled"
-    fi
-
+    # hostname/fqdn are quoted: bare, YAML turns names like "no.lan" or "null" into
+    # booleans/null and cloud-init would set the hostname to "False".
     cat <<CLOUDINIT
 #cloud-config
-hostname: ${short_name}
-fqdn: ${fqdn}
+hostname: '${short_name}'
+fqdn: '${fqdn}'
 manage_etc_hosts: true
 package_update: true
 package_upgrade: true
@@ -1531,13 +1696,64 @@ ${pkg_list}
 ssh_pwauth: true
 
 runcmd:
-  - systemctl enable qemu-guest-agent
-  - systemctl start qemu-guest-agent
-  - systemctl restart ssh || systemctl restart sshd || true${cache_runcmd}${gh_runcmd}
-  - apt-get clean${disable_ci}
+  - [ /usr/local/sbin/pve-prov-firstboot ]
 
 final_message: "pve-provision: cloud-init complete after \$UPTIME seconds"
 CLOUDINIT
+}
+
+# The VM's first-boot steps, as one real bash script (written by cloud-init, run from
+# runcmd, deletes itself). A runcmd list is a /bin/sh script without `set -e`, so a
+# failing line is invisible and "cloud-init finished" proves nothing. This script
+# records which steps failed in /var/lib/cloud/pve-prov.failed and only writes
+# pve-prov.ok if all of them worked; the provisioning host checks that marker.
+firstboot_script() {
+    cat <<'EOF'
+#!/bin/bash
+# pve-prov first-boot steps. Runs once from cloud-init, then removes itself.
+set -u
+failed=""
+step() { local name="$1"; shift; "$@" || failed+=" ${name}"; }
+
+agent_up() { systemctl enable qemu-guest-agent && systemctl start qemu-guest-agent; }
+sshd_up() {
+    mkdir -p /run/sshd && sshd -t \
+        && { systemctl restart ssh || systemctl restart sshd; } \
+        && sshd -T | grep -qix "permitrootlogin no" \
+        && sshd -T | grep -qix "passwordauthentication yes"
+}
+step agent agent_up
+step sshd sshd_up
+EOF
+    if [[ -n "$PROV_APT_CACHE" ]]; then
+        printf 'mirrors() {\n    %s\n}\nstep mirrors mirrors\n' "$(apt_https_to_http_cmd)"
+    fi
+    if [[ "$PROV_OPT_GH" == "y" ]]; then
+        cat <<EOF
+gh_install() {
+    mkdir -p -m 755 /etc/apt/keyrings \\
+        && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \\
+        && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \\
+        && echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \\
+        && apt-get update -qq \\
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${APT_OPTS} gh \\
+        && command -v gh >/dev/null
+}
+step gh gh_install
+EOF
+    fi
+    echo 'apt-get clean'
+    # Run-once tool: switch cloud-init off after this first boot so a later restart
+    # can't re-run it (new instance-id -> regenerated SSH host keys, new DHCP lease).
+    if [[ "$PROV_KEEP_CLOUD_INIT" != "y" ]]; then
+        echo 'touch /etc/cloud/cloud-init.disabled'
+    fi
+    cat <<'EOF'
+echo "${failed# }" > /var/lib/cloud/pve-prov.failed
+if [[ -z "$failed" ]]; then touch /var/lib/cloud/pve-prov.ok; fi
+rm -f -- "$0"
+exit 0
+EOF
 }
 
 # =============================================================================
@@ -1567,6 +1783,15 @@ generate_notes_html() {
         sysadmin_pw_row="<code style=\"background: #dcfce7; padding: 2px 6px; border-radius: 3px; font-size: 12px; margin-left: 8px;\">${PROV_SYSADMIN_PW}</code>"
     fi
 
+    # A visible warning in the notes if provisioning did not fully succeed
+    local status_html=""
+    case "$PROV_STATUS" in
+        unconfirmed)
+            status_html="  <div style=\"background: #fef3c7; padding: 10px 20px; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; font-size: 12px; color: #92400e;\">⚠️ <strong>Provisioning was not confirmed.</strong> When the VM is up, run on the Proxmox host: <code>${PROV_DETACH_CMD}</code></div>" ;;
+        degraded)
+            status_html="  <div style=\"background: #fef3c7; padding: 10px 20px; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; font-size: 12px; color: #92400e;\">⚠️ <strong>Some first-boot steps failed.</strong> See /var/log/cloud-init-output.log inside the VM.</div>" ;;
+    esac
+
     cat <<'HTMLEOF'
 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; color: #1a1a2e;">
 HTMLEOF
@@ -1577,7 +1802,7 @@ HTMLEOF
     <h2 style="color: #e0e0e0; margin: 0 0 4px 0; font-size: 20px;">⚙️ ${PROV_HOSTNAME}</h2>
     <span style="color: #94a3b8; font-size: 13px;">${type_label} · ${OS_NAMES[$PROV_OS]} · ID ${PROV_ID}</span>
   </div>
-
+${status_html}
   <!-- Resources -->
   <div style="background: #f8fafc; padding: 14px 20px; border-left: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0;">
     <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
@@ -1657,12 +1882,27 @@ HTMLEOF
 print_summary() {
     local ip="${1:-pending}"
 
-    header "Provisioning Complete! 🎉"
+    case "$PROV_STATUS" in
+        ok)          header "Provisioning Complete! 🎉" ;;
+        degraded)    header "Provisioning finished WITH PROBLEMS ⚠" ;;
+        unconfirmed) header "Provisioning NOT CONFIRMED ⚠" ;;
+    esac
     echo -e "  ${BOLD}${PROV_TYPE^^} ${PROV_ID}${RESET} — ${OS_NAMES[$PROV_OS]}"
     echo -e "  ${BOLD}Hostname:${RESET}    ${PROV_HOSTNAME}"
-    echo -e "  ${BOLD}IP:${RESET}          ${ip}"
-    echo
-    echo -e "  ${BOLD}Connect:${RESET}     ${GREEN}ssh sysadmin@${ip}${RESET}"
+    if [[ "$ip" == "pending" ]]; then
+        echo -e "  ${BOLD}IP:${RESET}          ${YELLOW}not detected${RESET} (see the warnings above)"
+    else
+        echo -e "  ${BOLD}IP:${RESET}          ${ip}"
+        echo
+        echo -e "  ${BOLD}Connect:${RESET}     ${GREEN}ssh sysadmin@${ip}${RESET}"
+    fi
+    if [[ "$PROV_STATUS" == "unconfirmed" ]]; then
+        echo
+        echo -e "  ${YELLOW}${BOLD}Required, once the VM is up:${RESET} ${PROV_DETACH_CMD}"
+    elif [[ "$PROV_STATUS" == "degraded" ]]; then
+        echo
+        echo -e "  ${YELLOW}Some first-boot steps failed (listed above). Check /var/log/cloud-init-output.log in the VM.${RESET}"
+    fi
     echo -e "  ${BOLD}Root PW:${RESET}     ${DIM}${PROV_ROOT_PW}${RESET} ${DIM}(also in Proxmox notes; console login only)${RESET}"
     if [[ "$PROV_SYSADMIN_PW_GENERATED" == "y" ]]; then
         echo -e "  ${BOLD}sysadmin PW:${RESET} ${DIM}${PROV_SYSADMIN_PW}${RESET} ${DIM}(generated; also in Proxmox notes)${RESET}"
@@ -1703,6 +1943,6 @@ main() {
 }
 
 # Run only when executed (not when sourced, e.g. by the tests).
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     main "$@"
 fi
